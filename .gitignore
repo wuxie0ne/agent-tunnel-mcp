@@ -1,0 +1,14 @@
+/target/
+/dist/
+/.sessions/
+*.sock
+__pycache__/
+/.agents/
+/.codex/
+/test-results/
+# Generated credentials and PID state must never enter version control.
+**/connector.json
+**/controller.json
+**/relay.json
+**/connector-state/
+*.log
