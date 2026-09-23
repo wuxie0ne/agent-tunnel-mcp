@@ -1,0 +1,30 @@
+[Unit]
+Description=Agent Tunnel session relay (loopback behind TLS)
+After=network.target
+
+[Service]
+Type=simple
+User=agent-tunnel
+Group=agent-tunnel
+ExecStart=/usr/local/bin/agent-tunnel relay --listen 127.0.0.1:8787 --session-file /var/lib/agent-tunnel/relay.json --admin-socket /run/agent-tunnel/admin.sock
+StateDirectory=agent-tunnel
+StateDirectoryMode=0700
+RuntimeDirectory=agent-tunnel
+RuntimeDirectoryMode=0700
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

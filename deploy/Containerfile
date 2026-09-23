@@ -1,0 +1,7 @@
+# Build artifacts first with scripts/package.sh using a musl target.
+# This image packages the prebuilt relay; it does not download a compiler at runtime.
+FROM scratch
+ARG BINARY=agent-tunnel
+COPY ${BINARY} /agent-tunnel
+USER 65532:65532
+ENTRYPOINT ["/agent-tunnel"]

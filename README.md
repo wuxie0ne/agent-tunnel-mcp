@@ -1,336 +1,369 @@
 # agent-tunnel
 
-临时、出站的远程命令执行通道，供本地终端 Agent 在**可丢弃的测试环境**中使用。
+`agent-tunnel` 是一个 Unix-only、临时、出站的远程命令执行通道，供本地终端 Agent 在**可丢弃的测试环境**中使用。Connector 运行在目标机上，Controller 和可选的 MCP stdio adapter 运行在本地，Relay 只负责认证后的连接转发。
 
-> **Test-only / not production ready.** 当前版本允许 Connector 所在操作系统用户执行任意 `argv`。必须由操作者显式传入 `connect --allow-exec` 和 `local --accept-session-risk`；这两个开关是整段 session 的批准，不是每条命令的人工审批。当前没有 E2EE、manual approval、PTY、stdin/`remote_write` 或 one-time join。
+> **Test-only / not production ready.** Connector 代表启动它的操作系统用户执行 `argv`，不是沙箱。`--allow-exec` 和 `--accept-session-risk` 是整段 session 的显式风险确认；默认 Controller 还会尝试通过独立 `/dev/tty` 对 `exec`/`write` 做逐次 Gate。它们都不是生产授权系统。请先阅读 [SECURITY.md](SECURITY.md)。
 
-本文档按工作区当前 Rust 源码（2026-09-22）书写。`docs/architecture-plan.md` 仍保留旧的设计规划，但规划、实现状态和实测状态分开记录。
+文档日期：2026-09-23。以下状态按本机 2026-09-23 工作区源码和截至当日明确报告的验证结果整理；更早的 PASS、当前回归、构建产物和未部署样例分别标注，不把旧结果冒充当前回归。文档不构成安全审计或生产验收。
 
-## 当前状态
+## 1. 状态摘要
 
-| 项目 | 当前结论 |
-| --- | --- |
-| 实现语言 | Rust，单一 `agent-tunnel` 二进制；Unix-only |
-| 默认构建 | `controller` + `relay` + `mcp`，见 Cargo features |
-| 目标端构建 | `--no-default-features`，只保留 Connector/Inspect 等不依赖 controller/relay/mcp 的部分 |
-| 传输 | Connector/Controller 到 Relay 的 WebSocket；公网入口应使用 WSS，Relay 本身只绑定 loopback |
-| 本地适配 | Unix socket CLI；官方 `rmcp` stdio MCP server |
-| MCP 工具 | `remote_info`、`remote_exec`、`remote_read`、`remote_cancel`；当前没有 write 工具 |
-| 运行限制 | 每 session 最多 16 个 job、最多 4 个 running job；每 job 内存输出环 1 MiB；单次 read 最多 32 KiB |
-| 验证状态 | 本次只更新文档和 Skill；没有安装依赖、构建二进制或做联网测试；仓库另有 Rust 单元测试和 Linux 标准库 E2E 基线 |
+| 能力 | 源代码状态 | 验证状态和边界 |
+| --- | --- | --- |
+| Rust full / connector-only | 默认 feature 为 `controller`、`relay`、`mcp`；`--no-default-features` 构建 Connector-only | Rust 测试 35 项 PASS；full/connector-only Clippy `-D warnings` PASS。x86_64 musl full 与 connector-only 静态 PIE 构建均已用 `file` 检查；二进制尺寸见发行状态。 |
+| Controller/Connector/Relay + E2EE | WebSocket/WSS 外层及 Noise E2EE payload；每次新连接重新握手 | 合并人工接管及到期修复后 `tests/e2e.py` 的 32 jobs PASS，含 Relay 侧 Noise 密文抓包、断线重连及不重放。 |
+| `channel_key` 和 role 凭证 | `controller.json` / `connector.json` 各含独立 role token 和相同 32-byte key；Relay 配置仅含 role-token hashes | 当前 E2E 覆盖角色隔离与凭证不泄露；凭证必须经既有可信运维渠道按角色分别交付，详见下文和 [SECURITY.md](SECURITY.md)。 |
+| 人工接管 PTY | CLI `attach --socket ... --job ... --incarnation ...` 独立TTY持有30s写入租约，结束清除缓存并限制Agent读写/取消 | `tests/attach.py` 真实TTY、互斥、敏感输出不可事后读取和超时回收 PASS；不是对同UID恶意代码的硬隔离，也不承诺所有TUI可自动操作。 |
+| stdin/PTY、`remote_write`、`remote_resize` | 已有 CLI、协议、MCP/pi 工具和 Linux PTY 实现 | 当前 32-job E2E 覆盖 PTY、stdin、shell、resize、终止和去重。stdin/PTY 需显式启用；`write` 必须复用调用方 request ID；这些能力不构成沙箱。 |
+| Controller manual Gate | 默认尝试使用独立 `/dev/tty` 对 `exec`/`write` 逐次审批 | `tests/manual_approval.py` 当前在真实 `/dev/tty`、无 TTY 闭锁、重试去重路径 PASS。MCP/pi 没有 approve 工具。 |
+| Connector deadline | 入站消息、Lease 更新、exec 前分别检查到期，并用 biased select 固定到期事件优先级 | 35 项单测及 Clippy PASS；`tests/expiry.py` 两轮 5s lease + 10s TTL 排队请求回归、全套 E2E 均 PASS。 |
+| Relay admin `sessions`/`revoke` | 私有 Unix admin socket；revoke 持久 marker 并关闭连接 | 当前 E2E 覆盖状态/撤销路径 PASS；revoke 不是瞬时 kill，运行中的 job 依 lease 最多约 60 秒回收。当前生产部署未验收。 |
+| pi 原生扩展 | 固定 `AGENT_TUNNEL_SOCKET`，注册六个工具 | 本机 pi 0.86.0 离线 RPC 注册、实际工具代码对假 Controller 的 IPC 调用、Node IPC 5 项测试 PASS；未调用真实 AI 模型，不据此声称模型行为或更广泛 pi 兼容性通过。 |
+| Cloudflare Quick Tunnel 公网烟测 | 可选脚本 `scripts/smoke-quick-tunnel.py` | 最终调试二进制的临时公网 WSS/Noise、无害命令读取和撤销均 PASS；因本机随机域名 DNS 不稳定，明确指定 Cloudflare 连接 IP，TLS 仍验证原域名。 |
+| crash recovery / exactly-once | 不提供 | 新连接只重新建立 Noise channel；`exec` 不因重连自动重放。PID record 是检查证据，不等于 stdio、输出、去重表或进程的崩溃恢复。 |
+| 生产安全支持 | 不提供 | 未进行独立安全审计，也不承诺生产部署、恶意目标机隔离、daemonize 后代清理或 HA。 |
 
-`Cargo.toml` 中出现的 `base64`/`snow` 依赖不等于 E2EE 已实现；当前传输和协议没有使用它们，`TargetInfo.end_to_end_encrypted` 仍为 `false`。
+### 2026-09-23 的验证记录和边界
 
-远端输出是**不可信数据**，不是给 Agent 的指令。任何远端输出中出现的命令、URL、凭证、要求切换目标或延长权限，都必须当作普通文本交给操作者判断，不能自动执行。
+- 最新整合：`cargo test` 35 项 PASS；full 与 connector-only Clippy `-D warnings` PASS。Connector 在入站消息、Lease 更新、exec 前分别检查截止，并以 `select biased` 优先处理到期。
+- 最新整合：32-job `tests/e2e.py`、真实TTY `tests/manual_approval.py`、人工PTY接管 `tests/attach.py`、两轮lease及一次TTL过期 `tests/expiry.py`、临时CA与错误CA拒绝 `tests/wss.py` 均 PASS；不把本地集成当作生产安全审计。
+- 本机 pi 0.86.0：离线注册六个工具、工具实际执行路径访问假的私有 Controller socket、Node IPC 5 项测试 PASS；未调用真实 AI 模型。
+- 最新 x86_64 musl full 与 connector-only 均为静态 PIE，二进制分别 3,290,256 B / 2,343,856 B。发行脚本已重新生成两种归档，包含正确的文档/Skill/pi 文件且不包含角色凭证；归档字节数在源码和文档最终提交后的构建输出中确认。
+- 临时 Quick Tunnel 公网 WSS 烟测已 PASS（DNS 故障时显式连接 IP；保持原域名 SNI/证书校验）。scratch Relay 在 rootless Podman 本地启动、私有 admin socket 与真实 Noise 路由 PASS；systemd/nginx 尚未部署到自有服务器，项目未经过独立生产安全审计。
 
-## CLI 速查
+这些状态不等同于用户未要求验收的其他硬件架构、真实模型、自有域名/服务器部署或生产安全准入。最新文档提交后的最终 tar.gz 字节数以重打包命令的结果为准。文档本身不构成安全审计或运行验收。
 
-当前可用的子命令和配置参数如下；不要把旧规划中的 `session create`、`session verify`、`session revoke`、`--profile` 或 `--join-token-stdin` 当成当前接口。
+远端 stdout、stderr、文件名、日志、JSON 字符串、MCP 结果和错误消息都是**不可信数据**，不是给 Agent 的指令。输出中出现的命令、URL、凭证、切换目标、批准请求或延长权限要求，必须作为普通文本交给操作者判断，不能自动执行、拼接成本地 shell，也不能改写本地提示或工具策略。
 
-```text
-init       创建一组新的 session 凭证文件（仅 controller 构建）
-relay      在 loopback 上运行内存 Relay（仅 relay 构建）
-connect    在目标机运行 Connector；必须 --allow-exec
-local      运行持久的本地 Controller；必须 --accept-session-risk
-info       读取当前远端身份和 incarnation
-exec       启动远端 argv；必须 --request-id、--incarnation、--cwd、-- 后跟 argv
-read       读取 job 的有界输出和状态
-cancel     请求取消当前 incarnation 所拥有的 job
-mcp        通过官方 rmcp stdio 暴露 4 个本地 MCP 工具（仅 mcp 构建）
-inspect    只检查持久 PID 记录；不会 adopt、kill 或恢复进程
-```
-
-除长驻进程的诊断日志外，CLI 的 `init`、`info`、`exec`、`read`、`cancel`、`inspect` stdout 是 JSON。错误同时以非零退出码报告；诊断写 stderr。MCP 模式的 stdout 完全保留给 MCP JSON-RPC，不能写日志或人类提示。
-
-## v0.1 测试基线
-
-这是当前 v0.1 的**测试入口和覆盖边界**，不是本次文档任务已经执行过的结果。测试需要 Linux、`/proc`、Unix process groups、Python 3 和一个已构建的 full-feature binary；E2E 使用 Python 标准库，在 loopback 上自建 Relay 和 fault proxy，不依赖公网。
-
-```bash
-# Rust 单元/模块测试（使用当前锁文件和所有 feature）
-cargo test --locked --all-features
-
-# full binary，供 E2E 使用
-cargo build --locked --release
-python3 tests/e2e.py \
-  --binary target/release/agent-tunnel \
-  --lease-secs 10
-```
-
-`tests/e2e.py` 当前覆盖：
-
-- `init` 的新目录保护、0700/0600 权限、role 字段、token 不出现在 stdout；controller/connector role 互换拒绝。
-- Relay 路由的错误 token、错 role、Origin、重复 instance 的 401/403/409 边界。
-- `info`、argv/cwd/env、null stdin、分离 stdout/stderr、非零退出、cursor、incarnation mismatch、timeout、cancel。
-- 1.1 MiB 输出造成 job ring 截断，验证 `output_truncated`、丢失 cursor 和单次 read 不超过 32 KiB；四个并发 job 后第五个收到 `RESOURCE_LIMIT`。
-- fault proxy 断开后的连接重建：同一 request ID 返回同一 job、计数文件仍为 1、不同参数返回 `REQUEST_CONFLICT`，不自动重跑。
-- controller 退出后的 lease 回收、Connector 正常退出时的 job 清理、PID record 字段和 0700/0600 状态权限。这里是受控退出路径，不是 crash recovery 或 stdio 恢复承诺。
-- rmcp stdio 的 JSON-RPC initialize/tools/list/tools/call；探测 `2025-06-18` 后再尝试 `2025-11-25`，一次运行记录实际协商到的版本，不宣称两个版本都已同时验收。
-
-Rust `state` 单元测试还覆盖 Linux `boot_id`/`start_ticks`、带 `)` 的 `/proc/<pid>/stat` comm、独占 state lock，以及 `matches`/`not_running`/`unknown` 检查结果。测试通过也不代表生产安全、E2EE、PTY、公网 WSS 或目标架构兼容。
-
-`scripts/package.sh`（由操作者明确运行时）构建 full 和 connector-only 两个分发包，并打印实际 binary/archive 字节数；本仓库不在文档中编造体积数字。`tests/e2e.py` 和打包脚本本身不在本次文档写入范围内。
-
-## 可执行快速开始：同一台 Linux 测试机
-
-下面是 5 个终端的最小闭环。它只使用 loopback Relay 和无敏感数据的测试命令；多主机场景见下一节。先构建二进制，且不要把 `connector.json` 或 `controller.json` 内容粘到命令行、聊天、日志或 issue 中。
-
-### 0. 构建并初始化 session
-
-```bash
-cargo build --locked --release
-
-BIN="$PWD/target/release/agent-tunnel"
-mkdir -p -m 700 "$PWD/.agent-tunnel"
-SESSION="$PWD/.agent-tunnel/demo-20260922" # 该目录必须尚不存在
-"$BIN" init \
-  --dir "$SESSION" \
-  --relay http://127.0.0.1:8787 \
-  --name demo-target \
-  --ttl-secs 3600
-```
-
-`init` 创建一个新的 0700 目录和三个 0600 文件：
+## 2. 架构和信任边界
 
 ```text
-$SESSION/relay.json       # Relay 侧：session 元数据和 connector/controller token hash
-$SESSION/controller.json  # 本地 Controller：controller role 的明文 token
-$SESSION/connector.json   # 目标 Connector：connector role 的明文 token
+本地 CLI / MCP stdio / pi extension
+        │ 0600 Unix socket；pi 使用 AGENT_TUNNEL_SOCKET
+        ▼
+Local Controller
+        │ WebSocket/WSS + Noise E2EE payload
+        ▼
+Loopback Relay ── TLS reverse proxy / tunnel（可选）
+        ▲
+        │ WebSocket/WSS + Noise E2EE payload
+        │
+Connector（目标 OS 用户）
+        │
+        └── argv / ordinary process group / optional stdin or PTY
 ```
 
-目录必须是新目录，因为 `init` 不递归创建 session 目录，也不会覆盖已有文件。stdout 只包含 `session_id`、`target_id`、过期时间和目录，不包含 token。两个明文 token 只存在于各自 role 文件；只把 `connector.json` 经已有可信运维渠道交给目标，不要把完整 session 目录复制到目标。
+- **Controller** 持有 `controller.json`，包含 controller role token 和 `channel_key`；它接收本地 CLI/MCP/pi IPC 请求，并维护 lease、pending request、审批 Gate 和重连状态。
+- **Connector** 持有 `connector.json`，包含 connector role token 和同一个 `channel_key`；它以目标机当前 UID/GID 创建 pipe 或 Linux PTY、进程和进程组。
+- **Relay** 只读取 `relay.json`，其中有 session、过期时间和两个 role token 的 hash。Relay 不应持有 `channel_key`，也不应能解密 E2E data frame；它仍能看到连接元数据并实施断开、延迟、丢弃或限流。
+- **Relay admin socket** 是独立的本地 Unix socket，只接受同 UID 的 `sessions`/`revoke` 请求；它不通过公网 WebSocket 暴露，也不是远程 Connector 的控制 API。
+- **WSS/TLS** 保护 Controller/Connector 到 Relay 的网络链路，但不能替代 Controller-Connector E2EE。Relay、TLS 终止端、Controller 主机和目标 OS 都必须分别纳入信任模型。
+- 本地 Controller socket 和 Relay admin socket 都要求私有目录、同 UID 和 `0600` 文件；这不是跨用户的通用授权系统。
 
-### 1. 终端 A：启动 Relay
+详细威胁模型、凭证交付、exec/PTY 风险、Relay admin 和已知限制见 [SECURITY.md](SECURITY.md)，设计和状态矩阵见 [docs/architecture-plan.md](docs/architecture-plan.md)。
 
-```bash
-"$BIN" relay \
-  --listen 127.0.0.1:8787 \
-  --session-file "$SESSION/relay.json"
+## 3. E2EE 协议边界
+
+目标协议参数固定为：
+
+```text
+Noise_NNpsk0_25519_ChaChaPoly_SHA256
 ```
 
-Relay 只绑定 loopback。要从另一台机器使用，需由操作者另行提供获准的 TLS/WSS 入口或反向隧道；不要让本项目自动修改 cloudflared、系统代理或全局网络配置。
+当前 `src/crypto.rs` 的实现要点是：
 
-### 2. 终端 B：启动 Connector
+- Snow `Builder` 使用上述 pattern 和 `psk(0, channel_key)`；prologue 为 `agent-tunnel/ATP<version>/<session_id>/<target_id>`，用于绑定协议、session 和目标身份。
+- ring resolver 提供 AEAD、随机数和 SHA；Snow 的 curve25519-dalek 支持提供 25519 DH。此描述是源码实现说明，不是第三方密码学审计结论。
+- `init` 使用操作系统随机源生成底层 32-byte `channel_key`，JSON 中以 64 个十六进制字符保存。Controller 和 Connector 必须使用同一 key；Relay 只拿 role token hashes。
+- `Init`/`Response` 是 Noise 握手帧；应用 packet 进入加密 `Data` 帧。加密数据按不超过 Noise 65535-byte 限制的分片发送，分片结束标记位于加密 payload 内；Relay 只转发外层 JSON frame。
+- 每次 Controller 或 Connector 重连都重新执行 Noise handshake，旧 channel 的 nonce/state 不复用；认证失败、篡改、乱序、跨 channel frame 或握手未完成时不得发送命令，也不得回退为明文 JSON packet。
+- Relay 可以转发 Noise frame，但其 role token 认证、连接状态、计时、大小、方向和错误元数据仍可见。E2EE 主要保护命令、stdin、PTY 数据和输出正文的机密性/完整性，不提供可用性或元数据隐私。
 
-同机测试：
+源代码包含 Noise 单元测试和 negative-path 测试，但完整二进制、Relay、WSS、错误 key、重连和真实两端互通仍应以实际测试为准。
+
+### 不重放的执行语义
+
+- `exec` 使用 `request_id`，Connector 在当前 incarnation 内对相同 ID 和相同参数做去重；参数变化返回 `REQUEST_CONFLICT`。
+- Controller 的网络断开、超时、审批返回或 peer 变化不会自动用新 ID 重发命令。一个 exec 可能已经产生副作用但回复未知，因此不能把超时当成失败，也不能用新 ID 盲目重跑。
+- 若仍是同一个 live Connector incarnation，可以用**相同** request ID 和完全相同参数查询/取得去重结果；incarnation 改变后，旧 job/request 不应被假定可恢复。
+- 新 Noise 握手只恢复通信通道，不恢复 stdio、PTY、输出环、pending reply、request 去重表或远端进程。不要把 PID 记录当成恢复控制权。
+- `remote_write` 同样必须带调用方生成的 `request_id`；不确定时不得用新 ID 重发输入。PTY 的 EOT/EOF 不保证应用退出。
+
+## 4. 凭证生成、可信交付和撤销
+
+`init` 创建一个不存在的私有目录，生成三个 `0600` 文件，目录为 `0700`：
+
+```text
+<session-dir>/relay.json       RelayConfig：session、connector/controller token hash、TTL
+<session-dir>/controller.json  EndpointConfig：controller token、channel_key、Relay URL
+<session-dir>/connector.json   EndpointConfig：connector token、channel_key、Relay URL
+```
+
+文件分工是安全边界，不只是部署便利：
+
+1. Relay 主机只部署 `relay.json`。它不需要、也不应收到 `controller.json` 或 `connector.json`。
+2. 本地 Controller 只读取 `controller.json`；目标 Connector 只读取 `connector.json`。两个 EndpointConfig 共享同一个 `channel_key`，但 role token 不同。
+3. 三类文件必须通过已有可信运维渠道分别交付，并在目标位置检查拥有者、目录 `0700` 和文件 `0600`。不要通过 URL query、shell 参数、公开工单、日志、环境变量、MCP 结果或远端输出传递 token/key。
+4. `init` 的 stdout 只包含 session/target/expiry/directory 元数据，不包含 token 或 `channel_key`。凭证文件仍是敏感材料，不能因为 stdout 未泄露就放宽文件权限。
+5. Endpoint token 是 role-scoped：connector token 只能用于 `/v1/connect/<session_id>`，controller token 只能用于 `/v1/control/<session_id>`。Relay 只保存 token hash，但拿到 endpoint 文件的攻击者同时可能获得明文 token 和 E2E key。
+6. session TTL 当前由 `init` 限制在 10–3600 秒；不要把 TTL 当作长期身份系统。
+
+### 按角色交付示例
+
+以下是供操作者在受信任环境复现的命令示例。先在受信任的管理机用新目录创建短期 session。Loopback URL 只适合同机本地测试；跨主机时须使用经过运维验证的 `wss://` TLS 入口、域名、CA 和反向代理，不要把公网明文 `ws://` 当作替代。
 
 ```bash
-"$BIN" connect \
-  --config "$SESSION/connector.json" \
-  --state-dir "$SESSION/connector-state" \
-  --lease-secs 60 \
+# mkdir 的父目录须为操作者私有；init 要求 demo-session 是尚不存在的新目录。
+umask 077
+mkdir -p "$HOME/.local/share/agent-tunnel"
+chmod 700 "$HOME/.local/share/agent-tunnel"
+agent-tunnel init \
+  --dir "$HOME/.local/share/agent-tunnel/demo-session" \
+  --relay ws://127.0.0.1:8787 \
+  --name disposable-test-target \
+  --ttl-secs 300
+```
+
+严格按角色交付：Relay 主机只收 `relay.json`；Controller 主机只收 `controller.json`；目标机只收 `connector.json`。使用已有、经批准且能验证收件主机/用户身份的秘密或配置交付渠道，并在目的端核对 owner、目录 `0700`、文件 `0600`。删除临时传输副本及不需要的明文备份。不要通过聊天、群发邮件、工单、URL、shell 参数、环境变量、日志或 Agent/MCP/pi 对话传送凭证文件内容。
+
+下面展示 loopback Relay 和无害 `printf` 流程；命令仅供人工按实际主机路径调整。Relay、Controller、Connector 是长驻进程，应按部署拓扑分别在自己的终端/服务管理器中运行，不要把下面整段当作一个会顺序完成的 shell 脚本。CLI 调用端先运行 `info` 并核对目标身份，再手动填入确认过的 incarnation（替换占位符）：
+
+```bash
+agent-tunnel relay --listen 127.0.0.1:8787 \
+  --session-file /secure/relay-side/relay.json
+agent-tunnel local \
+  --config /secure/controller-side/controller.json \
+  --socket /secure/run/controller.sock
+agent-tunnel connect \
+  --config /secure/target-side/connector.json \
   --allow-exec
-```
 
-`--allow-exec` 是明确的 session-wide 任意执行许可，缺少它 Connector 会拒绝启动。`connector-state` 会创建为 0700，状态和锁文件为 0600。目标机只需要 `connector.json` 和二进制；Controller 文件、Relay 文件和本地 socket 不应复制过去。
-
-### 3. 终端 C：启动 Local Controller
-
-```bash
-"$BIN" local \
-  --config "$SESSION/controller.json" \
-  --socket "$SESSION/controller.sock" \
-  --accept-session-risk
-```
-
-`--accept-session-risk` 是明确接受当前 test-only 风险的 session-wide 开关；它不提供 per-command manual approval。Unix socket 会被设为 0600，父目录必须是当前用户拥有且无 group/other 权限的 0700 目录。
-
-### 4. 终端 D：确认身份，然后执行远端 argv
-
-先查看完整 JSON，人工复制当前 `incarnation`：
-
-```bash
-"$BIN" info --socket "$SESSION/controller.sock"
-INCARNATION='<把 info JSON 中当前 Connector 的 incarnation 原样填入>'
-```
-
-执行必须明确给出 request ID、incarnation、绝对远端 cwd，并在 `--` 后给 argv：
-
-```bash
-"$BIN" exec \
-  --socket "$SESSION/controller.sock" \
-  --request-id demo-exec-001 \
-  --incarnation "$INCARNATION" \
+agent-tunnel info --socket /secure/run/controller.sock
+agent-tunnel exec \
+  --socket /secure/run/controller.sock \
+  --incarnation '<verified-incarnation>' \
   --cwd /tmp \
-  -- /bin/echo agent-tunnel-ok
+  --request-id read-only-example-001 \
+  -- /usr/bin/printf '%s\n' 'agent-tunnel smoke example'
 ```
 
-`exec` 的 JSON 会返回 `job_id`、PID/PGID、incarnation 和初始输出。复制其中的 `job_id` 后读取：
+如需人工操作同一个文本 PTY，先使用 `exec --pty -- /bin/sh` 创建 job，从返回 JSON 复制 `job_id` 并确认目标 `incarnation`，然后在**独立的操作者 TTY** 运行（不要给模型显示接管令牌）：
 
 ```bash
-JOB_ID='<把 exec JSON 中的 job_id 原样填入>'
-"$BIN" read --socket "$SESSION/controller.sock" --job "$JOB_ID" --cursor 0
+agent-tunnel attach \
+  --socket /secure/run/controller.sock \
+  --job '<verified-job-id>' \
+  --incarnation '<verified-incarnation>'
 ```
 
-长任务也只能通过显式 argv 启动，例如：
+`Ctrl+]` 退出接管；人工持有期间普通 MCP/pi/CLI 的 `read/write/cancel` 被拒绝，离开后清除该段保留输出并标识 cursor gap，30 秒不续约自动释放。工具输出仍按安全文本呈现，**这不是 vim/top 等任意 TUI 的完整终端模拟**；本地与远端共享同 UID 恶意程序不在本机制可隔离的范围内。
+
+默认 Controller Gate 通过独立 `/dev/tty` 逐次审批 `exec`/`write`；没有 TTY 时应闭锁。`--accept-session-risk` 会跳过逐次 Gate，是整段 session 的风险选择，不是审批记录。
+
+### Relay admin 撤销
+
+Relay 运行时会在私有目录创建 admin Unix socket；也可以显式传入 `relay --admin-socket PATH`。默认路径是首个 `relay.json` 同目录的 `relay-admin.sock`。socket 要求同 UID、父目录私有、权限 `0600`。
 
 ```bash
-"$BIN" exec \
-  --socket "$SESSION/controller.sock" \
-  --request-id demo-sleep-001 \
-  --incarnation "$INCARNATION" \
-  --cwd /tmp \
-  --timeout-ms 60000 \
-  -- /bin/sh -c 'sleep 30'
+# 读取 Relay 内存中的 session/连接状态
+agent-tunnel sessions --admin-socket /path/to/relay-admin.sock
+
+# 持久撤销指定 session
+agent-tunnel revoke \
+  --admin-socket /path/to/relay-admin.sock \
+  --session SESSION_ID
 ```
 
-这里 `/bin/sh -c` 是远端 argv 的显式第一项；本工具不会替你拼 shell。需要取消时使用 `cancel`，再用 `read` 确认：
+`revoke` 会先在内存中阻止继续授权，再尝试写入 `<relay.json>.revoked`，并关闭该 session 的现有连接。重启 Relay 时检测到 marker 会拒绝旧 session，必须创建新 session。正在运行的 Connector 会在 lease 边界退出并回收它管理的 job，当前 lease 上限为 60 秒；这不是瞬时 kill，也不能撤销已发生的副作用。
 
-```bash
-"$BIN" cancel --socket "$SESSION/controller.sock" --job "$JOB_ID"
-"$BIN" read --socket "$SESSION/controller.sock" --job "$JOB_ID" --cursor 0
-```
+如果 durable marker 写入失败，不能把“内存中已关闭连接”当成持久撤销；不要用旧 `relay.json` 重启 Relay，应隔离/删除旧凭证并创建新 session。admin socket 是本机管理员入口，拿到同 UID 控制权的进程可撤销 session，因此必须保护运行用户和父目录。
 
-### 5. 不确定响应时的唯一安全规则
+当前仍没有 one-time join、自动 key rotation 或远端 approve API。可信运维撤销是 Relay admin 的本地能力；它不等同于逐命令人工审批。
 
-如果 `exec` 的响应因断网、超时或 Controller/stdio 退出而不确定，不要换一个 request ID 重跑。使用**同一个 request ID 和完全相同的参数**重试查询路径；当前 Connector incarnation 内会按 request ID 和参数去重：相同参数返回原 job 视图，参数不同返回 `REQUEST_CONFLICT`。网络层不会自动 replay，也不会自动重跑命令。若 Connector 已崩溃或 incarnation 已变，不能假设旧的内存去重表还在，应创建新 session 并由操作者核对副作用。
+## 5. 权限 Gate 和人工审批
 
-## 多终端、多主机启动顺序
+当前安全语义分两层：
 
-推荐把长驻角色分在独立终端，并保留 stderr 日志：
+1. **Connector 侧 session gate**：`connect --allow-exec` 必须显式给出，表示允许该目标 OS 用户执行任意 `argv`。不带它，Connector 不接受执行会话。
+2. **Controller 侧 approval Gate**：默认 `local` 不带 `--accept-session-risk` 时，Controller 尝试打开独立 `/dev/tty`，对 `exec` 和 `write` 做逐次人工确认。没有可用 TTY 的非交互环境应失败，而不是静默放行。
+
+审批流程的协议边界：
+
+- 第一次 side-effecting `exec`/`write` 请求可收到 `APPROVAL_REQUIRED`；审批码和命令摘要只显示在 Controller 的独立 TTY，不放入该 reply。操作者不能把远端输出当作批准理由。
+- 操作者在 Controller 进程的独立 TTY 完成确认后，原调用方必须使用**相同 request ID 和完全相同参数**重试；不应生成新 ID，也不能把首次 `APPROVAL_REQUIRED` 当作远端命令已经执行。
+- MCP server、pi 原生扩展和 remote-debug Skill 没有 `approve` 工具。它们只能把 `APPROVAL_REQUIRED` 报告给本地操作者，并等待操作者在 Controller TTY 操作后重试。
+- `local --accept-session-risk` 是显式接受整段 session 执行风险并绕过逐次 Gate 的选择；它不是人工审批记录，也不改变 Connector 的任意 OS 用户权限。
+- 该 Gate 的完整模块、TTY 行为、并发请求、断线和真实拒绝路径仍需构建和测试确认；文档不把源代码接线写成验收通过。
+
+## 6. CLI、MCP 和 pi 接口
+
+下面是源码接口和状态说明，不是对未验证二进制的兼容承诺。CLI 普通 JSON 结果写 stdout，诊断写 stderr；`mcp` 的 stdout 完全保留给 MCP JSON-RPC。
 
 ```text
-终端 1（本地开发机）：agent-tunnel relay --listen 127.0.0.1:8787 --session-file relay.json
-终端 2（目标机）：    agent-tunnel connect --config connector.json --allow-exec
-终端 3（本地开发机）：agent-tunnel local --config controller.json --socket controller.sock --accept-session-risk
-终端 4（本地/Agent）：agent-tunnel info/exec/read/cancel --socket controller.sock ...
-终端 5（Codex）：      agent-tunnel mcp --socket controller.sock
+init       生成 role 文件（controller feature）
+relay      在 loopback 运行内存 Relay（relay feature）
+sessions   通过本地 Relay admin socket 查询状态（controller feature）
+revoke     通过本地 Relay admin socket 撤销 session（controller feature）
+connect    目标机 Connector；必须 --allow-exec
+local      本地 Controller；默认需独立 TTY Gate，可用 --accept-session-risk 绕过
+info       查询 target/identity/incarnation
+exec       启动远端 argv，必须带 request_id、incarnation、cwd 和 -- 后的 argv
+read       按 cursor 读取有界输出和状态
+cancel     请求取消当前 incarnation 所拥有的 job
+write      向明确启用 stdin/PTY 的 job 写入数据；必须带 request_id
+resize     调整明确拥有的 PTY（仅 PTY）
+mcp        通过 rmcp stdio 暴露六个本地 MCP tools（mcp feature）
+inspect    只检查持久 PID record，不 adopt、kill 或恢复进程
 ```
 
-顺序是：先在本地 `init`，再让 Relay 读取 `relay.json`，然后将仅限目标 role 的 `connector.json` 交给目标并启动 Connector，最后在本地使用 `controller.json` 启动 Controller。Controller 和 Connector 都主动连 Relay；目标不监听入站端口。
+`exec` 的交互字段与协议一致：`stdin` 和 `pty`。它们不是 shell 沙箱或权限提升；启用后，目标程序可能从后续输入中读取并执行更多操作。`remote_write` 的每次写入都要使用有效的 `request_id`；不确定时只能在同一个 job/incarnation 上遵循相同 ID 的去重策略。`remote_resize` 只对 PTY 有意义，不能把 pipe job 伪装成终端。
 
-跨主机时，`init --relay` 应指向获准的 `https://`/`wss://` 入口。Relay 进程仍只绑定 loopback，TLS 终止/隧道由外部组件负责。不要把 token 放到 URL query、Bearer 参数、shell history 或 Skill。若未来得到明确的网络测试授权且 DNS/路由失败，可以尝试在已有环境中用 `mgraftcp <原命令>` 运行诊断；本项目不安装它，也不修改系统代理。
+MCP 和 pi 的六个工具为：`remote_info`、`remote_exec`、`remote_read`、`remote_write`、`remote_resize`、`remote_cancel`。`remote_exec`/`remote_write` 都必须由调用方提供 `request_id`；`remote_resize` 不代替输入审批，也不能用于任意 PID。
 
-## 构建变体与体积优化
+### pi 原生扩展
 
-### full
+`integrations/pi/index.ts` 是可选的原生扩展，`integrations/pi/ipc.mjs` 通过本地 newline-delimited JSON IPC 调用 Controller。扩展启动时读取 `AGENT_TUNNEL_SOCKET` 并固定 socket 路径，工具参数不能改写目标 socket；IPC helper 会检查父目录/socket 的 owner、类型和私有权限。
 
-默认 feature 是 `controller`、`relay`、`mcp`；完整本地控制面、Relay 和 MCP 入口：
+扩展使用 pi loader 提供的 `typebox`，本项目不 npm install 依赖；本机 pi `0.86.0` 离线六工具注册和 Node IPC 5 项测试已 PASS，但未做真实模型测试或其他版本/发布版兼容性验收。扩展没有 approve 工具，远端输出仍只作为 JSON data 返回，不得因为 UI status、tool result 或错误文本而自动执行下一条命令。
+
+## 7. Job、进程组、stdin/PTY 和输出
+
+- 每个 job 绑定 `target_id`、`incarnation`、`job_id`、`request_id`、PID、PGID、Linux `boot_id` 和 `process_start_ticks` 等记录。
+- 普通 pipe exec 可分离 stdout/stderr；PTY exec 使用 Linux PTY master，目标程序获得 session leader/controlling terminal，输出通常是合并的终端流。PTY 只在 Linux 有实现保证；其他 Unix 应以实际错误为准。
+- `stdin=true` 或 `pty=true` 后，Connector 建立有限输入队列；`remote_write` 数据本身可能改变远端程序状态、执行命令或提交凭证。输入不是只读诊断。
+- `remote_write --eof` 对 pipe 关闭输入；对 PTY 发送 EOT，不能保证程序退出。`remote_resize` 的 rows/cols 当前限制为 1–1000；只允许作用于拥有的 PTY。
+- 普通 exec 使用 OS 进程组；cancel 是对该进程组的终止请求，必须再 `read` 确认终态。它不能撤销已经完成的文件、数据库、网络或其他副作用。
+- 普通进程组不是 cgroup。进程执行 `daemonize`、`setsid` 或以其他方式脱离进程组后，Connector 不保证能清理它；恶意 daemon 可能继续运行。
+- PID record 是人工检查证据。Linux 的 PID 复用、重启、容器 PID namespace、`/proc` 不可读或 boot/start tick 缺失，都可能使状态为 mismatch、not_running 或 unknown。程序不会根据 record 自动 adopt 或 kill 外部进程。
+- 每个 job 的内存输出环上限为 1 MiB，单次 read 上限为 32 KiB；输出可能被丢弃或以 UTF-8 lossy/control-escaped 形式返回。`output_truncated`、`dropped_before_cursor` 和 cursor 必须纳入诊断结论。
+- 断线不等于成功或失败。Connector 只在本进程、lease 和 session TTL 的边界内保留管理状态；crash 后不承诺恢复旧 stdio、PTY、输出、request 去重或远端进程。
+
+## 8. 构建、验证和发布
+
+### 8.1 两个独立构建变体
+
+默认 full 构建包含 `controller`、`relay`、`mcp`：
 
 ```bash
 cargo build --locked --release
-# 等价地显式指定默认角色 feature：
+# 等价的显式 feature 形式：
 cargo build --locked --release --features controller,relay,mcp
 ```
 
-### connector-only
-
-目标机不需要 controller、relay、rmcp 时：
+Connector-only 目标端构建使用 `--no-default-features`：
 
 ```bash
 cargo build --locked --release --no-default-features
 ```
 
-该变体保留 `connect` 和 `inspect` 等公共/目标侧代码，去掉 feature-gated 的 Local Controller、Relay 和 MCP server。目标二进制应从该构建产物复制；不要把 full 二进制和另一套凭证混用后再猜测权限边界。
+Debian/Ubuntu x86_64 上可选使用 `scripts/bootstrap-musl-debian.sh`：它从主机已配置的 APT source 下载 `musl`/`musl-dev`/`musl-tools` deb，并只解压到仓库 `target/`，不安装系统软件包；它需要网络访问，且本轮没有运行。该 helper 不会规避发行文件的默认拒绝覆盖策略。
 
-### 体积说明
+不要把 full 二进制和 connector-only 二进制、不同 session 文件或不同架构的产物混用后推断权限或兼容性。2026-09-23 报告的 `x86_64-unknown-linux-musl` full 与 connector-only 二进制为静态 PIE，分别是 3,290,256 B 和 2,343,856 B，且已用 `file` 检查；该结果不代表其他 target 的兼容性。
 
-`Cargo.toml` 的 release profile 已启用 `opt-level = "z"`、`lto = "fat"`、`codegen-units = 1`、`panic = "abort"` 和 `strip = "symbols"`。connector-only 通过 feature gating 减少代码路径和依赖，full 则包含 Relay/Controller/rmcp；最终字节数仍取决于目标架构、Rust/Cargo 版本和链接器。**本项目没有在本次文档更新中测量体积，不给出未经测量的 MB 数字。**在目标环境实际构建后再记录：
+### 8.2 发布脚本和签名
 
-```bash
-stat -c '%n %s bytes' target/release/agent-tunnel  # GNU/Linux
-```
+`scripts/package.sh [--force] [target-triple]` 会在独立的 `target/package-full` 和 `target/package-connector` 目录中分别构建 full/connector，生成带版本、目标三元组和变体名的 tar.gz，并生成 `dist/SHA256SUMS-<target>`。full 包含二进制、README/SECURITY、`docs/`、remote-debug Skill 和 pi 扩展运行文件；connector-only 包含二进制与 README/SECURITY，但不捆绑 docs、Skill 或 pi 扩展。脚本打印实际 binary/archive 字节数。
 
-## 凭证、权限与 session 生命周期
+默认拒绝覆盖 `dist/` 中同名 archive、checksum manifest 或签名；只有显式传 `--force` 才替换。如果 `--force` 时未提供 `MINISIGN_SECRET_KEY`，脚本会移除旧的同名 manifest 签名，避免留下与新 manifest 不匹配的签名。所有发布文件先在 `dist/` 同文件系统的本次 `mktemp` 目录构造，再逐文件原子发布；失败时只清理本次临时目录，不删除既有产物。Cargo 构建目录是 `target/package-*`；脚本不执行 Git add/commit/reset、不改源文件。最终脚本仍需用已提交工作树重新打包并核对产物；不应把源码检查等同于发行验收。当前 `dist/*.tar.gz` 已按更新后脚本生成；文档提交后建议重打以包含最新说明。
 
-- `init` 每次生成一个新的 session ID、target ID、controller token 和 connector token，并写出 `relay.json`、`controller.json`、`connector.json` 三个 0600 文件。
-- token 是 role-scoped：Connector token 只能尝试 `/v1/connect/<session_id>`，Controller token 只能尝试 `/v1/control/<session_id>`；Relay 保存 hash 并按 role 校验。
-- 当前没有 one-time join。endpoint 文件中的 token 在 TTL 内可被对应 role 使用；没有自动 verify/revoke 子命令。手工删除/隔离凭证和创建新 session 是当前撤销/轮换边界。
-- token 不能出现在命令行、环境变量、URL、stdout、MCP 工具结果、Skill 或远端输出中。示例只使用文件路径和占位符。
-- `incarnation` 在每次 Connector 进程启动时随机生成。`target_id`/session ID 相同不代表仍是同一个 Connector 进程。
-- Connector 或 Controller 进程重启会产生新的实例身份；不要把它当作可恢复 session，按“新 session”处理。Relay 仍在运行时，旧 role binding 会拒绝新的 instance。
-- Relay 自身重启时，其内存中的 peer binding、路由和待转发消息会丢失；`relay.json` 中的 hash 没有因此自动轮换。存活的 endpoint 可能用原 instance 重新绑定，但这不是持久恢复承诺，未确认的 request 仍可能是 unknown。运维上应把 Relay 重启当作需要重新创建/配对新 session 的事件，而不能依赖旧 job 恢复。
-
-## Job、PID 与断网语义
-
-每个 job 的持久记录包含：`session_id`、`target_id`、`incarnation`、`job_id`、`request_id`、PID、PGID、Linux `boot_id`、`process_start_ticks`、状态、退出码和终止原因。`JobView` 也带回 target/incarnation/job/PID/PGID/start ticks，便于操作者判断“同名主机”是否已换代。
-
-- `boot_id` 来自 `/proc/sys/kernel/random/boot_id`，`start_ticks` 来自 `/proc/<pid>/stat` 的 process starttime；二者只用于识别 PID 是否可能对应原进程。
-- `inspect --state-dir` 会将记录与当前 Linux 观察结果比较，并明确输出 stale/unknown 风险。记录是证据，不是 kill/adopt 权限。
-- Connector 只会对自己当前 `Command` 创建的进程组发信号；代码不会根据重启后恢复的 PID 记录直接杀进程，也不会自动 adopt 外部进程。进程组不是 cgroup，不能保证清理 daemonize/setsid 后代。
-- 传输短暂断开时，当前 Connector 内存中的 job 和输出环保留，Controller/Connector 在 lease 内尝试重连。Controller 每秒发送 lease；默认 lease 为 60 秒，可配置为 5–60 秒。超过 lease 或 session TTL，Connector 关闭其管理的 job；断线不等于成功恢复。
-- Connector crash 不承诺 stdio、Controller IPC、job 输出或旧 request 去重表恢复。PID record 可能留下可供人工检查的事实，但不是可靠的任务恢复机制。
-- Relay 不缓存离线命令；目标上线后不会自动执行断线期间积压的旧 exec。
-
-## 协议与容量边界
-
-WSS/WS 中承载的是本项目自己的版本化 JSON text-frame 协议，不是“WebSocket MCP”。MCP 只在本地 stdio adapter 与 Codex/pi 之间发生。当前 packet 类型是 `request`、`reply`、`lease` 和 `relay_error`；操作是 `info`、`exec`、`read`、`cancel`。单帧上限为 256 KiB。
-
-本地 CLI/Controller 之间是受保护 Unix socket 上的 newline-delimited JSON。`mcp` 子命令通过 `rmcp::transport::stdio()` 将同一操作映射为四个 MCP tools：
-
-1. `remote_info`：确认 target、UID/GID、cwd、权限提示、TTL 和当前 incarnation。
-2. `remote_exec`：必须提供 `request_id`、`expected_incarnation`、`argv`、绝对 `cwd`；可选 env/timeout；返回 job 视图。
-3. `remote_read`：按 cursor 读取最多 32 KiB 的有界 stdout/stderr 事件和状态。
-4. `remote_cancel`：请求取消当前 Connector incarnation 所拥有的 job；必须再 read 确认，不能撤销已经产生的业务副作用。
-
-没有 `remote_write`，因为当前执行器将 stdin 设为 null；也没有 PTY、resize 或交互式 shell。每 job 输出环最多保留 1 MiB，超过后丢弃最旧事件并通过 `output_truncated`/cursor 信息暴露丢失。文本视图是 UTF-8 lossy 并转义控制字符，不应当作原始二进制传输。
-
-## MCP 与 pi CLI 接入
-
-### Codex / rmcp stdio
-
-当前 MCP server 是 Rust `rmcp` 的 server-side stdio transport，不是远端 HTTP MCP。依赖启用 `server` 与 `transport-io` feature；源码在 `src/mcp.rs` 中调用 `rmcp::transport::stdio()`。启动命令是：
+`SOURCE_DATE_EPOCH` 可以显式固定归档时间。默认值取最新 Git commit 时间；非 Git 工作区才回退到当前时间。若工作树含未提交改动，归档内容来自当前工作树而 epoch 仍可能来自旧 commit，因此不能据此宣称可复现构建。排序、mtime、owner 和 gzip header 归一化也不等于工具链及全构建过程可复现。
 
 ```bash
-"$BIN" mcp --socket "$SESSION/controller.sock"
+# 新的 dist 文件名：默认拒绝覆盖已有文件
+scripts/package.sh x86_64-unknown-linux-musl
+
+# 仅在已确认要替换同名 dist 产物时才使用 --force
+scripts/package.sh --force x86_64-unknown-linux-musl
 ```
 
-交给 Codex 管理时，可在操作者明确同意修改 Codex 配置后执行：
+release profile 当前声明：
+
+```toml
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+```
+
+签名是可选的：只有设置 `MINISIGN_SECRET_KEY` 时，`package.sh` 才用 `minisign` 签名 checksum manifest。签名私钥不能写入仓库、命令示例或日志。校验流程需要通过独立可信渠道取得公钥：
 
 ```bash
-codex mcp add agent-tunnel -- \
-  /absolute/path/agent-tunnel mcp \
-  --socket /absolute/path/.agent-tunnel/demo-20260922/controller.sock
+scripts/verify-release.sh \
+  dist/SHA256SUMS-<target> \
+  <independently-obtained-minisign-public-key> \
+  dist/agent-tunnel-<version>-<target>-full.tar.gz
 ```
 
-这条命令只是配置入口，本文档更新没有执行它，也没有修改任何全局配置。MCP stdout 只能是协议消息；stderr 才能记录连接、风险和诊断。工具说明会要求先 `remote_info`，确认 incarnation，再 `remote_exec`；不确定响应时复用同一 request ID，不生成新 exec。
+`verify-release.sh` 同时验证 manifest 的 minisign 签名和指定 archive 的 SHA-256。**只有 checksum、没有可信公钥或签名，并不能认证发布来源**；checksum 只说明文件与 manifest 中的摘要一致。
 
-官方参考：[`rmcp` crate](https://docs.rs/rmcp)、[MCP Rust SDK](https://github.com/modelcontextprotocol/rust-sdk)。本项目只依赖 SDK 提供的本地 stdio server；远程执行协议仍是本项目自己的协议。
+| 变体 | target | 静态 PIE binary（2026-09-23 报告） | 更新脚本后的 tar.gz |
+| --- | --- | ---: | --- |
+| full | `x86_64-unknown-linux-musl` | 3,290,256 B | 当前版本已打包；最终归档大小以文档提交后复建结果为准 |
+| connector-only | `x86_64-unknown-linux-musl` | 2,343,856 B | 当前版本已打包；最终归档大小以文档提交后复建结果为准 |
 
-### pi CLI + Skill
+这次用更新脚本重新构建并检查了两个 x86_64 归档、SHA-256 和内容；文档最后一次提交会改变 full 归档，因此不要把此前归档字节数当作最终值。
 
-当前没有 pi 原生 extension，也不要求安装第三方 MCP。`skills/remote-debug/SKILL.md` 只教 Agent 调用本地 `agent-tunnel` CLI；它不保存 token、不实现第二套状态机、不把远程文本当指令。可显式把本仓库 Skill 交给 pi：
+### 8.3 测试入口和边界
+
+以下是可重复的验证入口；截至 2026-09-23 的已报告结果和待回归项分别标注：
 
 ```bash
-pi --skill "$PWD/skills/remote-debug" --mode json -p \
-  "使用 remote-debug Skill；socket=$SESSION/controller.sock，先确认远端身份，再按 Skill 的 CLI 流程执行一次无害诊断。"
+cargo test --locked --all-features
+cargo build --locked --release
+cargo build --locked --release --no-default-features
+python3 tests/e2e.py \
+  --binary target/release/agent-tunnel \
+  --lease-secs 10
 ```
 
-也可以在 pi 的已信任项目中按其 Skill discovery 规则加载目录后使用 `/skill:remote-debug`。`--mode json` 是 pi 自己的 JSONL 事件输出；它不改变 `agent-tunnel` 每次 CLI 调用的 JSON stdout 约定。Skill 不覆写 pi 自带的本地 bash/read/edit，远端操作始终写成 `agent-tunnel exec/read/cancel`，并明确 `--request-id`、`--incarnation`、`--cwd` 和 `--`。
+35 项 Rust 单测、full/connector-only Clippy、32-job E2E、真实TTY审批、人工接管与租约截止回归当前 PASS。本地TLS/WSS原域名校验和错误CA拒绝、临时Quick Tunnel公网WSS/Noise（显式连接IP）、Podman scratch Relay 亦已验证；pi 0.86.0 离线注册六工具、执行真实扩展代码调用假Controller和Node IPC 5测试PASS，未调用真实 AI 模型。以下仍需分别验收：
 
-官方参考：[pi coding-agent README](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md)、[pi Skills](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/skills.md)。这些文档核对不等于本机已安装 pi 版本的兼容性验收。
+- `init` 目录/文件权限、角色分离、token/key 不出 stdout；Relay 错 token、错 role、Origin、重复 instance、外层 frame 限制。
+- Noise `NNpsk0` 双方握手、ring/curve25519 解析、错误 key、错误 prologue、篡改/截断/乱序/跨 channel frame、分片重组、重连后新 handshake 和明文 fallback 拒绝。
+- `exec` request ID 去重和不重放；`APPROVAL_REQUIRED`、独立 TTY 通过/拒绝、无 TTY 失败、相同 ID/参数重试、MCP/pi 不具备 approve 权限。
+- stdin/PTY 生命周期、pipe 与 PTY 输出差异、`remote_write` request ID、EOF、PTY resize、断线、取消和 process-group/daemon 行为。
+- Relay `sessions`/`revoke`、同 UID admin socket、durable `.revoked` marker、重启拒绝旧 session、lease 最多 60 秒回收和持久化失败告警。
+- full 与 `--no-default-features` 两种包在目标架构上的独立构建、启动和真实权限边界；WSS 证书/CA、反向代理、Containerfile、systemd、发布签名和下载验证。
+- pi 0.86.0 本地扩展加载、socket 权限拒绝、六工具 schema 和取消/超时；模型行为测试另行记录，不能由源代码对照替代。
 
-## 安全边界与已知限制
+跨架构、真实公网 WSS、部署和模型行为仍需各自的运行证据；静态检查、`file` 输出和本地 IPC 测试不能替代这些验收。
 
-- 这是 test-only 任意执行器，不是沙箱。Connector 以启动它的 OS UID/GID 访问文件、网络和进程；`cwd` 不是访问控制边界。
-- 当前只依赖 transport TLS/WSS 和 role token；Relay 能看到并转发命令/输出。没有 Connector-Controller E2EE，不能把 Relay 当作不可信中继。
-- `--allow-exec` 与 `--accept-session-risk` 都是显式 session-wide 风险确认；没有 per-command manual approval，不能声称“人工审批已实现”。
-- 没有 PTY、stdin、`remote_write`、resize、one-time join、自动 revoke、可恢复 job spool 或 Connector crash 后 stdio 恢复。
-- stdout/stderr 只在进程退出和输出采集范围内可见；read 有 32 KiB 上限，job ring 有 1 MiB 上限；输出可能截断、丢失或在断线时变为 unknown。
-- Relay 是内存状态，当前最多加载 16 个 session 文件、最多 64 个连接 worker；没有 HA、持久路由或离线队列。Relay 重启不能恢复 pending reply。
-- 取消是请求，不是已经终止的证明；必须 read 查看终态。任何已经发生的文件、数据库、网络副作用都不能由 cancel 回滚。
-- 不要用 PID 文件推断可以安全 kill；Linux PID 复用、boot_id/start_ticks 缺失或容器 PID namespace 都可能使身份只能是 unknown。
-- 本次没有构建、实网、目标架构、代理、WSS、Codex 或 pi 版本兼容性结果。文档中的命令是按当前 CLI 源码整理的操作路径，不是运行验收报告。
+## 9. 部署样例
 
-## 后续路线（不代表已实现）
+仓库中的样例位于 `deploy/`：
 
-1. 在隔离测试目标完成 full/connector-only 构建和本地/获准 WSS 闭环，记录架构、工具链、入口和脱敏日志。
-2. 增加真正的 session revoke、one-time join、身份确认和人工 per-command approval；先定义状态机再改 CLI。
-3. 为 Relay 不可信模型设计独立的 Controller-Connector E2EE 和重放保护，保留当前 token role scope。
-4. 选择 cgroup/容器级清理边界，并明确 crash、daemonize、容器 PID namespace 的处理；不要把 PID record 升格为控制权。
-5. 单独设计 stdin/PTY/resize/写入 lease；在此之前不要在文档或 Skill 中暗示存在交互终端。
-6. 设计持久 job metadata/output spool 和可验证 resume；即使实现，也不能把非幂等 exec 宣称为 exactly-once。
-7. 在 pi 版本验收后再考虑原生 extension；MCP Streamable HTTP/公网 MCP 不是当前默认路径。
-8. 为 Relay 做持久路由/HA、固定域名和运维撤销，但不让外部入口改变本地工具的安全语义。
+- `deploy/agent-tunnel-relay.service` 以专用非 root 用户启动 Relay，绑定 `127.0.0.1:8787`，并启用 `NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome`、私有临时目录和受限地址族等 systemd 限制。
+- `deploy/nginx.conf` 在 TLS 入口终止 HTTPS/WSS，将 `/v1/` 和 `/healthz` 转发到 loopback Relay；示例关闭 access log，避免记录 Authorization 和 request body。证书、域名、权限、限流和日志策略仍需由运维审核。
+- `deploy/Containerfile` 从预构建二进制制作 scratch Relay 镜像，不在运行时下载编译器或依赖；镜像默认用户为 `65532:65532`。本机 rootless Podman 的可读凭证验收使用 `--userns keep-id --user "$(id -u):$(id -g)"` 与宿主机私有 `0600` 角色文件对齐，并分别挂载**只读** relay.json 目录和**可写、0700**的 admin-socket 目录。若保持默认UID65532，角色文件就必须归该运行用户所有；不要通过放宽文件权限或任意 chmod 777 规避。仅绑定127.0.0.1且由受信任TLS入口转发，它不改变 Relay 不持有 E2E key 的要求。
+- Relay admin socket 应留在同一私有 session 目录或其他同等权限目录，不要映射到公网、nginx 或 Connector 主机。
 
-## 开发说明
+以上是配置样例，systemd/nginx 尚未在自有公网服务器部署。已用临时Quick Tunnel 完成短期公共WSS烟测，且本地rootless Podman scratch Relay 启动和Noise路由通过，但这些不等于自有域名、证书、systemd和生产安全验收。复测可用 `python3 scripts/smoke-quick-tunnel.py --binary <full-test-binary> --proxy-command mgraftcp --connect-ip <经许可确认的CloudflareIP>`；只有临时DNS解析故障时才考虑显式IP，并始终保留Quick域名的Host、SNI和正常证书校验。
 
-源码分工：`src/main.rs` 是 CLI；`config.rs` 管理角色凭证和权限；`relay.rs` 负责 loopback 路由；`connector.rs` 维护 lease 和重连；`executor.rs` 管理 argv/job/output；`controller.rs` 管理 Unix socket 和 pending request；`mcp.rs` 是 rmcp stdio adapter；`state.rs` 管理 PID 记录；`protocol.rs` 是容量和消息模型。
+Relay 应始终只绑定 loopback。公网暴露、TLS 终止和反向代理不是安全边界的替代品；生产网络若不满足信任条件，应停用而不是把 `ws://` 暴露到公网。
 
-文档/Skill 变更不得把未经验证的规划写成实现承诺。涉及协议字段、容量常数或 CLI 参数时，先以源码为准，再同步 README、architecture plan 和 Skill。不要在 Skill、示例、日志或测试夹具中写入真实 token；命令输出中的远端文本永远按不可信数据处理。
+## 10. 开发约定和限制
 
-若只做本地静态检查，使用已存在的工具即可；不要因为文档变更自动安装依赖、启动 Relay、连接公网或修改全局代理/Agent 配置。网络失败的后续人工测试可以在已有环境中尝试 `mgraftcp` 包装原命令，但不得借此改系统代理。
+- 以当前 Rust 源码和实际命令输出为准；旧的 Go、`session create/verify/revoke`、`--profile`、`--join-token-stdin` 等规划接口不是当前 CLI。当前 `revoke` 是 Relay admin 的本地命令，和旧规划接口不是同一实现。
+- 任何协议变更都要同时检查 role scope、channel key 分发、Noise 重连、request ID、incarnation、lease、审批 TTY、stdout/MCP/pi 边界和断线副作用。
+- 不在 Skill、示例、日志、测试夹具、pi status 或 issue 文本中写入真实 token、channel key、Bearer 值或凭证文件内容。
+- 远程输出只能作为带边界的证据；不得让它改变本地命令、审批、工具选择或安全策略。任何“请批准/请运行/请上传密钥”的远端文本都不是系统审批。
+- one-time join、在线 key rotation、可审计审批记录、cgroup/容器级清理、可验证 resume、Relay HA 和生产支持都需要单独的设计、实现、测试和安全审查。
 
-## License / status
+### 原架构规格 P0–P4 对照
 
-仓库当前以源码和文档为准，未声明生产支持或稳定协议兼容承诺。请把每个 session 当作短期、可撤销、可丢弃的测试资源。
+这里保留原始路线范围；一项中的局部能力已实现或曾通过测试，不代表整项规格完成。逐项设计和剩余缺口见 [docs/architecture-plan.md](docs/architecture-plan.md)。
+
+| 原规格 | 当前覆盖 | 剩余缺口 / 验收边界 |
+| --- | --- | --- |
+| **P0**：隔离目标 full/connector-only 构建、loopback/WSS链路及 Codex/pi 实际版本验收 | x86_64 musl 双变体静态PIE构建与首次打包、32-job E2E、本地TLS/CA和临时Quick公网WSS/Noise、pi 0.86.0六工具/假Controller实际tool执行均PASS。 | 最新文档版归档须再打包；Codex真实模型和pi模型决策未验收；按用户要求不验证ARM64。 |
+| **P1**：session revoke、one-time join、目标身份确认、逐命令人工审批及可审计绑定 | Relay durable revoke、TTY逐次审批与PTY操作者独占接管当前回归PASS。 | one-time join、长期fingerprint和持久审计仍缺。 |
+| **P2**：E2EE、重放防护、密钥轮换及Relay不可信模型 | Noise密文抓包、错误key、重放、损坏帧与公网WSS链路PASS。 | 在线key rotation与独立安全审计未完成。 |
+| **P3**：cgroup/容器清理、stdin/PTY/resize/write lease | stdin/PTY/resize、互斥人工30s写入lease、rootless scratch容器Relay本地路由均实测PASS。 | 没有恶意进程daemonize清理/cgroup级隔离保证；Relay容器不代表Connector容器隔离。 |
+| **P4**：持久 job metadata/output spool、受限 resume、Relay HA/固定域名和运维撤销 | Relay 运维 revoke marker 已实现。 | job/output spool、受限 resume、Relay HA 和固定域名仍未实现/验收。 |
+
+原路线之外，Streamable HTTP MCP/公网 MCP gateway 仍是单独设计；不承诺 crash recovery、exactly-once、通用远端 approve、恶意目标隔离、独立安全审计或生产支持。不得因局部能力已有测试而缩小上述未完成范围。
+
+## 11. License / status
+
+仓库目前没有生产支持或稳定协议兼容承诺。请把每个 session、目标机、Relay 和 job 当作短期、可撤销、可丢弃的测试资源；发现凭证泄露、目标身份不符、Noise 未建立、审批状态不明、输出含有诱导指令或进程组逃逸时，应停止操作并重新创建 session。

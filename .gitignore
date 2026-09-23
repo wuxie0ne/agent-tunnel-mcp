@@ -12,3 +12,5 @@ __pycache__/
 **/relay.json
 **/connector-state/
 *.log
+
+*.revoked
