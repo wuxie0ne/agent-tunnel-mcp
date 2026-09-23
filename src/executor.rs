@@ -10,7 +10,10 @@ use std::{
     io,
     path::Path,
     process::{ExitStatus, Stdio},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -33,6 +36,10 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const INPUT_QUEUE_CAPACITY: usize = 16;
 const MAX_INPUT_BYTES: usize = 4 * 1024;
+const OWNER_LEASE: Duration = Duration::from_secs(30);
+// Suppress PTY bytes still arriving from the kernel after a handoff. This is
+// a bounded best effort, not a promise to censor future application output.
+const HANDOFF_QUIET: Duration = Duration::from_millis(750);
 
 struct InputCommand {
     data: Vec<u8>,
@@ -43,6 +50,13 @@ struct InputState {
     sender: mpsc::Sender<InputCommand>,
     pty: Option<Master>,
     closed: bool,
+    pending: Arc<AtomicUsize>,
+    last_completed: Arc<Mutex<Instant>>,
+}
+
+struct Owner {
+    token: String,
+    deadline: Instant,
 }
 
 struct Job {
@@ -52,8 +66,77 @@ struct Job {
     next_seq: u64,
     cancel: watch::Sender<bool>,
     input: Option<InputState>,
+    owner: Option<Owner>,
+    quiet_until: Option<Instant>,
 }
 impl Job {
+    fn scrub(&mut self) {
+        for event in &mut self.output {
+            // Replacing every byte with NUL preserves valid UTF-8. This only
+            // erases the retained ring, not copies already sent to an owner.
+            unsafe {
+                event.text.as_bytes_mut().fill(0);
+            }
+        }
+        self.output.clear();
+        self.bytes = 0;
+        // Even an empty ring must expose a gap to clients holding old cursors.
+        self.next_seq = self.next_seq.saturating_add(1);
+    }
+    fn release_owner(&mut self) {
+        self.owner = None;
+        self.scrub();
+        self.quiet_until = Some(Instant::now() + HANDOFF_QUIET);
+    }
+    fn expire_owner(&mut self) {
+        if self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| Instant::now() >= owner.deadline)
+        {
+            self.release_owner();
+        }
+    }
+    fn handoff_draining(&self) -> bool {
+        self.quiet_until.is_some_and(|until| {
+            let now = Instant::now();
+            now < until
+                || self.input.as_ref().is_some_and(|input| {
+                    input.pending.load(Ordering::Acquire) != 0
+                        || now.duration_since(
+                            *input
+                                .last_completed
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner()),
+                        ) < HANDOFF_QUIET
+                })
+        })
+    }
+    fn access(&mut self, id: &str, token: Option<&str>) -> Option<Reply> {
+        self.expire_owner();
+        match (&self.owner, token) {
+            (Some(owner), Some(candidate)) if owner_token_matches(&owner.token, candidate) => None,
+            (Some(_), _) => Some(Reply::err(
+                id,
+                "TAKEOVER_ACTIVE",
+                "PTY held by a local operator",
+            )),
+            (None, Some(_)) => Some(Reply::err(
+                id,
+                "OWNER_EXPIRED",
+                "operator ownership is no longer active",
+            )),
+            (None, None) if self.handoff_draining() => Some(Reply::err(
+                id,
+                "HANDOFF_DRAINING",
+                "PTY output handoff is draining",
+            )),
+            (None, None) => {
+                self.quiet_until = None;
+                None
+            }
+        }
+    }
     fn view(&self, cursor: u64) -> JobView {
         let first = self.output.front().map_or(self.next_seq, |e| e.seq);
         let mut events = Vec::new();
@@ -87,6 +170,13 @@ impl Job {
         }
     }
     fn push(&mut self, stream: &str, bytes: &[u8]) {
+        self.expire_owner();
+        if self.handoff_draining() {
+            // Extend the quiet window as long as delayed PTY data keeps coming.
+            self.quiet_until = Some(Instant::now() + HANDOFF_QUIET);
+            self.next_seq = self.next_seq.saturating_add(1);
+            return;
+        }
         let text = safe_text(bytes);
         // Keep every stored event small enough for one read. The normal pipe
         // buffer is much smaller, but this also keeps an internal caller from
@@ -196,19 +286,56 @@ impl Manager {
         match req.op {
             Operation::Info => Reply::ok(&req.id, &self.info),
             Operation::Exec(args) => self.exec(&req.id, args),
-            Operation::Write { job_id, data, eof } => self.write(&req.id, job_id, data, eof),
-            Operation::Resize { job_id, rows, cols } => self.resize(&req.id, job_id, rows, cols),
-            Operation::Read { job_id, cursor } => match self.jobs.get(&job_id) {
-                Some(job) => Reply::ok(&req.id, lock_job(job).view(cursor)),
+            Operation::Takeover {
+                job_id,
+                expected_incarnation,
+                owner_token,
+            } => self.takeover(&req.id, job_id, expected_incarnation, owner_token),
+            Operation::Release {
+                job_id,
+                expected_incarnation,
+                owner_token,
+            } => self.release(&req.id, job_id, expected_incarnation, owner_token),
+            Operation::Write {
+                job_id,
+                data,
+                eof,
+                owner_token,
+            } => self.write(&req.id, job_id, data, eof, owner_token),
+            Operation::Resize {
+                job_id,
+                rows,
+                cols,
+                owner_token,
+            } => self.resize(&req.id, job_id, rows, cols, owner_token),
+            Operation::Read {
+                job_id,
+                cursor,
+                owner_token,
+            } => match self.jobs.get(&job_id) {
+                Some(job) => {
+                    let mut j = lock_job(job);
+                    if let Some(rejected) = j.access(&req.id, owner_token.as_deref()) {
+                        rejected
+                    } else {
+                        Reply::ok(&req.id, j.view(cursor))
+                    }
+                }
                 None => Reply::err(
                     &req.id,
                     "JOB_NOT_FOUND",
                     "job is not owned by this Connector incarnation",
                 ),
             },
-            Operation::Cancel { job_id } => match self.jobs.get(&job_id) {
+            Operation::Cancel {
+                job_id,
+                owner_token,
+            } => match self.jobs.get(&job_id) {
                 Some(job) => {
-                    let j = lock_job(job);
+                    let mut j = lock_job(job);
+                    if let Some(rejected) = j.access(&req.id, owner_token.as_deref()) {
+                        return rejected;
+                    }
                     let running = j.record.state == "running";
                     if running {
                         let _ = j.cancel.send(true);
@@ -232,6 +359,95 @@ impl Manager {
                 ),
             },
         }
+    }
+    fn takeover(
+        &mut self,
+        id: &str,
+        job_id: String,
+        incarnation: String,
+        token: Option<String>,
+    ) -> Reply {
+        if incarnation != self.info.incarnation {
+            return Reply::err(id, "TARGET_MISMATCH", "target incarnation changed");
+        }
+        let Some(job) = self.jobs.get(&job_id) else {
+            return Reply::err(
+                id,
+                "JOB_NOT_FOUND",
+                "job is not owned by this Connector incarnation",
+            );
+        };
+        let mut j = lock_job(job);
+        j.expire_owner();
+        if j.record.state != "running" || j.input.as_ref().and_then(|i| i.pty.as_ref()).is_none() {
+            return Reply::err(
+                id,
+                "INVALID_ARGUMENT",
+                "takeover requires a running PTY job",
+            );
+        }
+        if let Some(owner) = &mut j.owner {
+            if token
+                .as_deref()
+                .is_some_and(|value| owner_token_matches(&owner.token, value))
+            {
+                owner.deadline = Instant::now() + OWNER_LEASE;
+                return Reply::ok(id, serde_json::json!({"job_id": job_id, "renewed": true}));
+            }
+            return Reply::err(id, "TAKEOVER_ACTIVE", "PTY held by a local operator");
+        }
+        if token.is_some() {
+            return Reply::err(
+                id,
+                "OWNER_EXPIRED",
+                "operator ownership is no longer active",
+            );
+        }
+        if j.handoff_draining() {
+            return Reply::err(id, "HANDOFF_DRAINING", "PTY output handoff is draining");
+        }
+        if j.input
+            .as_ref()
+            .is_some_and(|i| i.pending.load(Ordering::Acquire) != 0)
+        {
+            return Reply::err(
+                id,
+                "INPUT_BUSY",
+                "previous input is not drained; retry takeover",
+            );
+        }
+        let secret = random_id();
+        j.scrub();
+        let cursor = j.next_seq;
+        j.quiet_until = None;
+        j.owner = Some(Owner {
+            token: secret.clone(),
+            deadline: Instant::now() + OWNER_LEASE,
+        });
+        Reply::ok(
+            id,
+            serde_json::json!({
+                "job_id": job_id, "owner_token": secret, "next_cursor": cursor, "lease_secs": 30,
+            }),
+        )
+    }
+    fn release(&mut self, id: &str, job_id: String, incarnation: String, token: String) -> Reply {
+        if incarnation != self.info.incarnation {
+            return Reply::err(id, "TARGET_MISMATCH", "target incarnation changed");
+        }
+        let Some(job) = self.jobs.get(&job_id) else {
+            return Reply::err(
+                id,
+                "JOB_NOT_FOUND",
+                "job is not owned by this Connector incarnation",
+            );
+        };
+        let mut j = lock_job(job);
+        if let Some(rejected) = j.access(id, Some(&token)) {
+            return rejected;
+        }
+        j.release_owner();
+        Reply::ok(id, serde_json::json!({"job_id": job_id, "released": true}))
     }
     fn exec(&mut self, id: &str, args: Exec) -> Reply {
         let signature = match serde_json::to_string(&args) {
@@ -422,23 +638,41 @@ impl Manager {
         let (cancel, cancelled) = watch::channel(false);
         let (input, input_task) = if let Some(master) = master.clone() {
             let (sender, receiver) = mpsc::channel(INPUT_QUEUE_CAPACITY);
-            let task = tokio::spawn(run_pty_input(master.clone(), receiver));
+            let pending = Arc::new(AtomicUsize::new(0));
+            let last_completed = Arc::new(Mutex::new(Instant::now() - HANDOFF_QUIET));
+            let task = tokio::spawn(run_pty_input(
+                master.clone(),
+                receiver,
+                pending.clone(),
+                last_completed.clone(),
+            ));
             (
                 Some(InputState {
                     sender,
                     pty: Some(master),
                     closed: false,
+                    pending,
+                    last_completed,
                 }),
                 Some(task),
             )
         } else if let Some(stdin) = pipe_stdin {
             let (sender, receiver) = mpsc::channel(INPUT_QUEUE_CAPACITY);
-            let task = tokio::spawn(run_pipe_input(stdin, receiver));
+            let pending = Arc::new(AtomicUsize::new(0));
+            let last_completed = Arc::new(Mutex::new(Instant::now() - HANDOFF_QUIET));
+            let task = tokio::spawn(run_pipe_input(
+                stdin,
+                receiver,
+                pending.clone(),
+                last_completed.clone(),
+            ));
             (
                 Some(InputState {
                     sender,
                     pty: None,
                     closed: false,
+                    pending,
+                    last_completed,
                 }),
                 Some(task),
             )
@@ -452,6 +686,8 @@ impl Manager {
             next_seq: 0,
             cancel,
             input,
+            owner: None,
+            quiet_until: None,
         }));
         self.jobs.insert(job_id.clone(), job.clone());
         self.requests.insert(
@@ -499,9 +735,42 @@ impl Manager {
             })
             .await;
         }));
+        let expiry_job = Arc::downgrade(&job);
+        self.handles.push(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let Some(job) = expiry_job.upgrade() else {
+                    break;
+                };
+                let mut j = lock_job(&job);
+                j.expire_owner();
+                if j.record.state != "running" {
+                    break;
+                }
+            }
+        }));
         Reply::ok(id, lock_job(&job).view(0))
     }
-    fn write(&mut self, id: &str, job_id: String, data: String, eof: bool) -> Reply {
+    fn write(
+        &mut self,
+        id: &str,
+        job_id: String,
+        data: String,
+        eof: bool,
+        owner_token: Option<String>,
+    ) -> Reply {
+        let job = self.jobs.get(&job_id).cloned();
+        if let Some(job) = &job {
+            if let Some(rejected) = lock_job(job).access(id, owner_token.as_deref()) {
+                return rejected;
+            }
+        } else if owner_token.is_some() {
+            return Reply::err(
+                id,
+                "OWNER_EXPIRED",
+                "operator ownership is no longer active",
+            );
+        }
         if data.len() > MAX_INPUT_BYTES {
             return Reply::err(
                 id,
@@ -509,7 +778,7 @@ impl Manager {
                 "write data must be at most 4096 UTF-8 bytes",
             );
         }
-        let signature = match serde_json::to_string(&(&job_id, &data, eof)) {
+        let signature = match serde_json::to_string(&(&job_id, &data, eof, &owner_token)) {
             Ok(signature) => format!(
                 "write:{:x}",
                 <sha2::Sha256 as sha2::Digest>::digest(signature.as_bytes())
@@ -539,7 +808,7 @@ impl Manager {
             );
         }
 
-        let Some(job) = self.jobs.get(&job_id).cloned() else {
+        let Some(job) = job else {
             return Reply::err(
                 id,
                 "JOB_NOT_FOUND",
@@ -549,6 +818,9 @@ impl Manager {
         let bytes = data.len();
         let (pty, send_result) = {
             let mut j = lock_job(&job);
+            if let Some(rejected) = j.access(id, owner_token.as_deref()) {
+                return rejected;
+            }
             if j.record.state != "running" {
                 return Reply::err(id, "INPUT_CLOSED", "job is no longer running");
             }
@@ -563,10 +835,14 @@ impl Manager {
                 return Reply::err(id, "INPUT_CLOSED", "pipe stdin is already closed");
             }
             let pty = input.pty.is_some();
+            input.pending.fetch_add(1, Ordering::Release);
             let send_result = input.sender.try_send(InputCommand {
                 data: data.into_bytes(),
                 eof,
             });
+            if send_result.is_err() {
+                input.pending.fetch_sub(1, Ordering::AcqRel);
+            }
             if send_result.is_ok() && eof && !pty {
                 // The worker shuts down its ChildStdin after this command. Do
                 // not accept a later write while that close is in flight.
@@ -601,7 +877,14 @@ impl Manager {
             }
         }
     }
-    fn resize(&mut self, id: &str, job_id: String, rows: u16, cols: u16) -> Reply {
+    fn resize(
+        &mut self,
+        id: &str,
+        job_id: String,
+        rows: u16,
+        cols: u16,
+        owner_token: Option<String>,
+    ) -> Reply {
         if !(1..=1000).contains(&rows) || !(1..=1000).contains(&cols) {
             return Reply::err(
                 id,
@@ -617,7 +900,10 @@ impl Manager {
             );
         };
         let master = {
-            let j = lock_job(job);
+            let mut j = lock_job(job);
+            if let Some(rejected) = j.access(id, owner_token.as_deref()) {
+                return rejected;
+            }
             if j.record.state != "running" {
                 return Reply::err(id, "INPUT_CLOSED", "job is no longer running");
             }
@@ -627,11 +913,14 @@ impl Manager {
             let Some(master) = input.pty.as_ref() else {
                 return Reply::err(id, "INVALID_ARGUMENT", "job was not started with pty=true");
             };
+            // Keep the ownership check and synchronous ioctl in the same
+            // critical section as the automatic expiry sweeper.
+            if let Err(error) = master.resize(rows, cols) {
+                return Reply::err(id, "PTY_RESIZE_FAILED", error.to_string());
+            }
             master.clone()
         };
-        if let Err(error) = master.resize(rows, cols) {
-            return Reply::err(id, "PTY_RESIZE_FAILED", error.to_string());
-        }
+        drop(master);
         Reply::ok(
             id,
             serde_json::json!({
@@ -645,7 +934,14 @@ impl Manager {
     fn duplicate_reply(&self, id: &str, entry: &RequestEntry) -> Reply {
         match &entry.outcome {
             RequestOutcome::Job { job_id, pid } => match self.jobs.get(job_id) {
-                Some(job) => Reply::ok(id, lock_job(job).view(0)),
+                Some(job) => {
+                    let mut j = lock_job(job);
+                    if let Some(rejected) = j.access(id, None) {
+                        rejected
+                    } else {
+                        Reply::ok(id, j.view(0))
+                    }
+                }
                 None => Reply::err(
                     id,
                     "EXECUTION_UNKNOWN",
@@ -710,6 +1006,13 @@ impl Manager {
             let _ = handle.await;
         }
     }
+}
+
+fn owner_token_matches(expected: &str, candidate: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    expected.len() == 64
+        && candidate.len() == 64
+        && bool::from(expected.as_bytes().ct_eq(candidate.as_bytes()))
 }
 
 fn lock_job(job: &Mutex<Job>) -> MutexGuard<'_, Job> {
@@ -910,6 +1213,9 @@ async fn run_job(runtime: JobRuntime) {
 
     let final_record = {
         let mut j = lock_job(&job);
+        if j.owner.is_some() {
+            j.release_owner();
+        }
         j.record.state = termination_reason
             .unwrap_or(if status.as_ref().is_some_and(|status| status.is_ok()) {
                 "exited"
@@ -950,9 +1256,14 @@ async fn drain<R: AsyncRead + Unpin>(mut reader: R, job: Arc<Mutex<Job>>, stream
 async fn run_pipe_input(
     mut stdin: tokio::process::ChildStdin,
     mut receiver: mpsc::Receiver<InputCommand>,
+    pending: Arc<AtomicUsize>,
+    last_completed: Arc<Mutex<Instant>>,
 ) {
     while let Some(command) = receiver.recv().await {
-        if !command.data.is_empty() && stdin.write_all(&command.data).await.is_err() {
+        let failed = !command.data.is_empty() && stdin.write_all(&command.data).await.is_err();
+        *last_completed.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+        pending.fetch_sub(1, Ordering::AcqRel);
+        if failed {
             break;
         }
         if command.eof {
@@ -962,18 +1273,24 @@ async fn run_pipe_input(
     }
 }
 
-async fn run_pty_input(master: Master, mut receiver: mpsc::Receiver<InputCommand>) {
+async fn run_pty_input(
+    master: Master,
+    mut receiver: mpsc::Receiver<InputCommand>,
+    pending: Arc<AtomicUsize>,
+    last_completed: Arc<Mutex<Instant>>,
+) {
     while let Some(command) = receiver.recv().await {
-        if !command.data.is_empty() && master.write_all(&command.data).await.is_err() {
-            break;
-        }
-        if command.eof {
+        let mut failed = !command.data.is_empty() && master.write_all(&command.data).await.is_err();
+        if !failed && command.eof {
             // PTYs do not have a pipe-like half-close.  EOT is an input
             // character interpreted by the line discipline/application and
             // therefore is deliberately not treated as an exit guarantee.
-            if master.write_all(&[0x04]).await.is_err() {
-                break;
-            }
+            failed = master.write_all(&[0x04]).await.is_err();
+        }
+        *last_completed.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+        pending.fetch_sub(1, Ordering::AcqRel);
+        if failed {
+            break;
         }
     }
 }
@@ -1045,6 +1362,7 @@ mod tests {
                 Operation::Read {
                     job_id: job_id.into(),
                     cursor: 0,
+                    owner_token: None,
                 },
             )));
             if current.state != "running" {
@@ -1067,6 +1385,7 @@ mod tests {
                 Operation::Read {
                     job_id: job_id.into(),
                     cursor: 0,
+                    owner_token: None,
                 },
             )));
             if output_text(&current).contains(needle) {
@@ -1083,7 +1402,7 @@ mod tests {
         let info = test_info();
         let mut manager = Manager::new(info.clone(), &dir).unwrap();
         let data = "sensitive-stdin-not-retained-verbatim";
-        let encoded = serde_json::to_string(&("job", data, false)).unwrap();
+        let encoded = serde_json::to_string(&("job", data, false, Option::<String>::None)).unwrap();
         let digest = format!(
             "write:{:x}",
             <sha2::Sha256 as sha2::Digest>::digest(encoded.as_bytes())
@@ -1108,6 +1427,7 @@ mod tests {
                 job_id: "job".into(),
                 data: data.into(),
                 eof: false,
+                owner_token: None,
             },
         ));
         assert!(duplicate.error.is_none());
@@ -1117,6 +1437,7 @@ mod tests {
                 job_id: "job".into(),
                 data: data.into(),
                 eof: false,
+                owner_token: None,
             },
         ));
         assert_eq!(new_write.error.unwrap().code, "RESOURCE_LIMIT");
@@ -1178,6 +1499,8 @@ mod tests {
             next_seq: 0,
             cancel,
             input: None,
+            owner: None,
+            quiet_until: None,
         };
         for _ in 0..300 {
             job.push("stdout", b"x");
@@ -1218,6 +1541,8 @@ mod tests {
             next_seq: 0,
             cancel,
             input: None,
+            owner: None,
+            quiet_until: None,
         };
         job.push("stdout", &vec![b"x"[0]; MAX_OUTPUT + MAX_READ]);
         assert!(job.bytes <= MAX_OUTPUT);
@@ -1281,6 +1606,7 @@ mod tests {
                 job_id: initial.job_id.clone(),
                 data: "alpha\n".into(),
                 eof: true,
+                owner_token: None,
             },
         ));
         assert!(first.error.is_none());
@@ -1290,6 +1616,7 @@ mod tests {
                 job_id: initial.job_id.clone(),
                 data: "alpha\n".into(),
                 eof: true,
+                owner_token: None,
             },
         ));
         assert_eq!(duplicate.result, first.result);
@@ -1299,6 +1626,7 @@ mod tests {
                 job_id: initial.job_id.clone(),
                 data: "beta\n".into(),
                 eof: true,
+                owner_token: None,
             },
         ));
         assert_eq!(
@@ -1350,6 +1678,7 @@ mod tests {
                 job_id: initial.job_id.clone(),
                 rows: 0,
                 cols: 80,
+                owner_token: None,
             },
         ));
         assert_eq!(
@@ -1362,6 +1691,7 @@ mod tests {
                 job_id: initial.job_id.clone(),
                 rows: 40,
                 cols: 100,
+                owner_token: None,
             },
         ));
         assert!(resized.error.is_none());
@@ -1372,6 +1702,7 @@ mod tests {
                 job_id: initial.job_id.clone(),
                 data: "stty size\n".into(),
                 eof: false,
+                owner_token: None,
             },
         ));
         assert!(size_request.error.is_none());
@@ -1384,6 +1715,7 @@ mod tests {
                 job_id: initial.job_id.clone(),
                 data: "printf READY\\n".into(),
                 eof: false,
+                owner_token: None,
             },
         ));
         assert!(ready.error.is_none());
@@ -1394,6 +1726,7 @@ mod tests {
             "pty-cancel",
             Operation::Cancel {
                 job_id: initial.job_id.clone(),
+                owner_token: None,
             },
         ));
         assert!(cancel.error.is_none());
@@ -1424,6 +1757,7 @@ mod tests {
             "cancel-request",
             Operation::Cancel {
                 job_id: initial.job_id.clone(),
+                owner_token: None,
             },
         ));
         assert!(cancel.error.is_none());
@@ -1431,6 +1765,312 @@ mod tests {
         assert_eq!(terminal.state, "cancelled");
         assert_eq!(terminal.termination_reason.as_deref(), Some("cancelled"));
         assert!(!group_exists(pgid));
+        manager.shutdown().await;
+        drop(manager);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn operator_lease_scrubs_output_and_blocks_agent_operations() {
+        let dir = temp_state_dir();
+        let info = test_info();
+        let mut manager = Manager::new(info.clone(), &dir).unwrap();
+        let mut args = exec_args(&info, vec!["/bin/cat".into()], 60_000);
+        args.pty = true;
+        let initial = view(manager.handle(request("operator-pty", Operation::Exec(args))));
+        let job_id = initial.job_id;
+        let job = manager.jobs[&job_id].clone();
+        {
+            let mut j = lock_job(&job);
+            j.push("pty", b"pre-existing");
+            j.input
+                .as_ref()
+                .unwrap()
+                .pending
+                .store(1, Ordering::Release);
+        }
+        let take = |id: &str, owner_token: Option<String>| {
+            request(
+                id,
+                Operation::Takeover {
+                    job_id: job_id.clone(),
+                    expected_incarnation: info.incarnation.clone(),
+                    owner_token,
+                },
+            )
+        };
+        let mismatch = manager.handle(request(
+            "wrong-inc",
+            Operation::Takeover {
+                job_id: job_id.clone(),
+                expected_incarnation: "different".into(),
+                owner_token: None,
+            },
+        ));
+        assert_eq!(mismatch.error.unwrap().code, "TARGET_MISMATCH");
+        assert_eq!(
+            manager.handle(take("busy", None)).error.unwrap().code,
+            "INPUT_BUSY"
+        );
+        lock_job(&job)
+            .input
+            .as_ref()
+            .unwrap()
+            .pending
+            .store(0, Ordering::Release);
+        let result = manager.handle(take("owner", None)).result.unwrap();
+        let token = result["owner_token"].as_str().unwrap().to_string();
+        assert_eq!(token.len(), 64);
+        assert!(
+            !serde_json::to_string(&manager.info)
+                .unwrap()
+                .contains(&token)
+        );
+        assert_eq!(
+            manager.handle(take("outsider", None)).error.unwrap().code,
+            "TAKEOVER_ACTIVE"
+        );
+        for op in [
+            Operation::Read {
+                job_id: job_id.clone(),
+                cursor: 0,
+                owner_token: None,
+            },
+            Operation::Cancel {
+                job_id: job_id.clone(),
+                owner_token: None,
+            },
+            Operation::Resize {
+                job_id: job_id.clone(),
+                rows: 24,
+                cols: 80,
+                owner_token: None,
+            },
+            Operation::Write {
+                job_id: job_id.clone(),
+                data: "agent\n".into(),
+                eof: false,
+                owner_token: None,
+            },
+        ] {
+            assert_eq!(
+                manager
+                    .handle(request(&random_id(), op))
+                    .error
+                    .unwrap()
+                    .code,
+                "TAKEOVER_ACTIVE"
+            );
+        }
+        assert!(
+            manager
+                .handle(take("renew", Some(token.clone())))
+                .error
+                .is_none()
+        );
+        lock_job(&job).push("pty", b"manual-secret");
+        let owner_view = view(manager.handle(request(
+            "owner-read",
+            Operation::Read {
+                job_id: job_id.clone(),
+                cursor: 0,
+                owner_token: Some(token.clone()),
+            },
+        )));
+        assert!(output_text(&owner_view).contains("manual-secret"));
+        assert_eq!(
+            manager
+                .handle(request(
+                    "bad-release",
+                    Operation::Release {
+                        job_id: job_id.clone(),
+                        expected_incarnation: info.incarnation.clone(),
+                        owner_token: random_id(),
+                    }
+                ))
+                .error
+                .unwrap()
+                .code,
+            "TAKEOVER_ACTIVE"
+        );
+        // Force a deadline without sleeping 30s; the independent sweeper must
+        // expire it even if no client sends a Read/Write/Release request.
+        lock_job(&job).owner.as_mut().unwrap().deadline = Instant::now() - Duration::from_millis(1);
+        tokio::time::sleep(Duration::from_millis(280)).await;
+        assert!(lock_job(&job).owner.is_none());
+        assert!(lock_job(&job).output.is_empty());
+        assert_eq!(
+            manager
+                .handle(take("stale-renew", Some(token)))
+                .error
+                .unwrap()
+                .code,
+            "OWNER_EXPIRED"
+        );
+        assert_eq!(
+            manager
+                .handle(request(
+                    "early-read",
+                    Operation::Read {
+                        job_id: job_id.clone(),
+                        cursor: 0,
+                        owner_token: None,
+                    }
+                ))
+                .error
+                .unwrap()
+                .code,
+            "HANDOFF_DRAINING"
+        );
+        lock_job(&job).quiet_until = Some(Instant::now() - Duration::from_millis(1));
+        let agent_view = view(manager.handle(request(
+            "agent-read",
+            Operation::Read {
+                job_id: job_id.clone(),
+                cursor: 0,
+                owner_token: None,
+            },
+        )));
+        assert!(agent_view.dropped_before_cursor.is_some());
+        assert!(!output_text(&agent_view).contains("manual-secret"));
+        let second = manager.handle(take("second", None)).result.unwrap();
+        let token = second["owner_token"].as_str().unwrap().to_owned();
+        lock_job(&job)
+            .input
+            .as_ref()
+            .unwrap()
+            .pending
+            .store(1, Ordering::Release);
+        assert!(
+            manager
+                .handle(request(
+                    "second-release",
+                    Operation::Release {
+                        job_id: job_id.clone(),
+                        expected_incarnation: info.incarnation.clone(),
+                        owner_token: token,
+                    }
+                ))
+                .error
+                .is_none()
+        );
+        // A queued operator write must finish BEFORE agent access resumes,
+        // even if the original quiet deadline has already passed.
+        lock_job(&job).quiet_until = Some(Instant::now() - Duration::from_millis(1));
+        let agent_read = || {
+            request(
+                &random_id(),
+                Operation::Read {
+                    job_id: job_id.clone(),
+                    cursor: 0,
+                    owner_token: None,
+                },
+            )
+        };
+        assert_eq!(
+            manager.handle(agent_read()).error.unwrap().code,
+            "HANDOFF_DRAINING"
+        );
+        {
+            let input = lock_job(&job);
+            let input = input.input.as_ref().unwrap();
+            *input.last_completed.lock().unwrap() = Instant::now();
+            input.pending.store(0, Ordering::Release);
+        }
+        assert_eq!(
+            manager.handle(agent_read()).error.unwrap().code,
+            "HANDOFF_DRAINING"
+        );
+        *lock_job(&job)
+            .input
+            .as_ref()
+            .unwrap()
+            .last_completed
+            .lock()
+            .unwrap() = Instant::now() - HANDOFF_QUIET;
+        assert!(manager.handle(agent_read()).error.is_none());
+        manager.shutdown().await;
+        drop(manager);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn owner_write_request_id_is_never_replayed() {
+        let dir = temp_state_dir();
+        let output = dir.join("written");
+        let info = test_info();
+        let mut manager = Manager::new(info.clone(), &dir).unwrap();
+        let script = format!(
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; done",
+            output.display()
+        );
+        let mut args = exec_args(&info, vec!["/bin/sh".into(), "-c".into(), script], 60_000);
+        args.pty = true;
+        let job = view(manager.handle(request("writer-pty", Operation::Exec(args))));
+        let job_id = job.job_id;
+        let token = manager
+            .handle(request(
+                "writer-take",
+                Operation::Takeover {
+                    job_id: job_id.clone(),
+                    expected_incarnation: info.incarnation.clone(),
+                    owner_token: None,
+                },
+            ))
+            .result
+            .unwrap()["owner_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let write = || {
+            request(
+                "writer-once",
+                Operation::Write {
+                    job_id: job_id.clone(),
+                    data: "unique-line\n".into(),
+                    eof: false,
+                    owner_token: Some(token.clone()),
+                },
+            )
+        };
+        assert!(manager.handle(write()).error.is_none());
+        assert!(manager.handle(write()).error.is_none());
+        for _ in 0..100 {
+            if output.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(fs::read_to_string(output).unwrap(), "unique-line\n");
+        assert_eq!(
+            manager
+                .handle(request(
+                    "writer-conflict",
+                    Operation::Release {
+                        job_id: job_id.clone(),
+                        expected_incarnation: "wrong".into(),
+                        owner_token: token.clone(),
+                    }
+                ))
+                .error
+                .unwrap()
+                .code,
+            "TARGET_MISMATCH"
+        );
+        assert!(
+            manager
+                .handle(request(
+                    "writer-release",
+                    Operation::Release {
+                        job_id: job_id.clone(),
+                        expected_incarnation: info.incarnation.clone(),
+                        owner_token: token,
+                    }
+                ))
+                .error
+                .is_none()
+        );
         manager.shutdown().await;
         drop(manager);
         fs::remove_dir_all(dir).unwrap();

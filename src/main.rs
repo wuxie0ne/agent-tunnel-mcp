@@ -6,6 +6,8 @@ compile_error!("agent-tunnel currently supports Unix targets only");
 mod admin;
 #[cfg(feature = "controller")]
 mod approval;
+#[cfg(feature = "controller")]
+mod attach;
 mod config;
 mod connector;
 #[cfg(feature = "controller")]
@@ -92,6 +94,16 @@ enum Commands {
         socket: PathBuf,
         #[arg(long)]
         accept_session_risk: bool,
+    },
+    /// Human-only PTY takeover; ownership token stays inside local IPC.
+    #[cfg(feature = "controller")]
+    Attach {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        job: String,
+        #[arg(long)]
+        incarnation: String,
     },
     /// Inspect the remote identity before executing commands.
     #[cfg(feature = "controller")]
@@ -255,6 +267,12 @@ async fn run(cli: Cli) -> Result<()> {
             accept_session_risk,
         } => controller::run(config, socket, accept_session_risk).await,
         #[cfg(feature = "controller")]
+        Commands::Attach {
+            socket,
+            job,
+            incarnation,
+        } => attach::run(&socket, &job, &incarnation).await,
+        #[cfg(feature = "controller")]
         Commands::Info { socket } => print_reply(socket, None, protocol::Operation::Info).await,
         #[cfg(feature = "controller")]
         Commands::Exec {
@@ -295,13 +313,22 @@ async fn run(cli: Cli) -> Result<()> {
                 protocol::Operation::Read {
                     job_id: job,
                     cursor,
+                    owner_token: None,
                 },
             )
             .await
         }
         #[cfg(feature = "controller")]
         Commands::Cancel { socket, job } => {
-            print_reply(socket, None, protocol::Operation::Cancel { job_id: job }).await
+            print_reply(
+                socket,
+                None,
+                protocol::Operation::Cancel {
+                    job_id: job,
+                    owner_token: None,
+                },
+            )
+            .await
         }
         #[cfg(feature = "controller")]
         Commands::Write {
@@ -318,6 +345,7 @@ async fn run(cli: Cli) -> Result<()> {
                     job_id: job,
                     data,
                     eof,
+                    owner_token: None,
                 },
             )
             .await
@@ -336,6 +364,7 @@ async fn run(cli: Cli) -> Result<()> {
                     job_id: job,
                     rows,
                     cols,
+                    owner_token: None,
                 },
             )
             .await

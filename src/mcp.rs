@@ -43,6 +43,14 @@ impl ServerHandler for Server {
         _: RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let mut args = req.arguments.unwrap_or_default();
+        // A caller cannot smuggle a manually held PTY capability through a
+        // schema extension or the default serde unknown-field behaviour.
+        if args.contains_key("owner_token") || args.contains_key("op") {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "Operator ownership is not available to MCP tools",
+            )])
+            .into());
+        }
         let id = if req.name == "remote_exec" || req.name == "remote_write" {
             match args.remove("request_id").and_then(|v| v.as_str().map(str::to_owned)) {
             Some(id) if crate::protocol::valid_id(&id) => id,
@@ -97,4 +105,15 @@ pub async fn run(socket: PathBuf) -> anyhow::Result<()> {
     let service = Server { socket }.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn operator_token_is_not_an_mcp_tool_argument() {
+        let schema = serde_json::to_string(&super::tools()).unwrap();
+        assert!(!schema.contains("owner_token"));
+        assert!(!schema.contains("takeover"));
+        assert!(!schema.contains("release"));
+    }
 }

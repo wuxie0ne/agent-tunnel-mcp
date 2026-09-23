@@ -21,24 +21,45 @@ pub struct Request {
 pub enum Operation {
     Info,
     Exec(Exec),
+    /// Only an authenticated local operator client is meant to call these.
+    /// The token is not an argv flag, target Info field, or MCP tool parameter.
+    Takeover {
+        job_id: String,
+        expected_incarnation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_token: Option<String>,
+    },
+    Release {
+        job_id: String,
+        expected_incarnation: String,
+        owner_token: String,
+    },
     Read {
         job_id: String,
         #[serde(default)]
         cursor: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_token: Option<String>,
     },
     Cancel {
         job_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_token: Option<String>,
     },
     Write {
         job_id: String,
         data: String,
         #[serde(default)]
         eof: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_token: Option<String>,
     },
     Resize {
         job_id: String,
         rows: u16,
         cols: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_token: Option<String>,
     },
 }
 

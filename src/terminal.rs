@@ -249,3 +249,148 @@ mod tests {
         );
     }
 }
+
+/// Independent operator terminal; never inherits stdin/stdout as a fallback.
+/// Raw mode and fd flags are restored on every ordinary return, including
+/// SIGINT handled by the attach event loop. SIGKILL/crash cannot run Drop.
+#[cfg(feature = "controller")]
+pub(crate) struct OperatorTty {
+    io: AsyncFd<OwnedFd>,
+    raw: RawMode,
+}
+
+#[cfg(feature = "controller")]
+struct RawMode {
+    fd: OwnedFd,
+    saved: libc::termios,
+    flags: i32,
+}
+
+#[cfg(feature = "controller")]
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        // SAFETY: the fd remains owned by self and saved was returned by
+        // tcgetattr for this exact terminal before entering raw mode.
+        unsafe {
+            libc::tcsetattr(self.fd.as_raw_fd(), libc::TCSANOW, &self.saved);
+            libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, self.flags);
+        }
+    }
+}
+
+#[cfg(feature = "controller")]
+impl OperatorTty {
+    pub(crate) fn open() -> io::Result<Self> {
+        // A daemon with a borrowed /dev/tty must not silently become an
+        // "operator"; require its own inherited interactive standard fds.
+        if unsafe { libc::isatty(0) } != 1 || unsafe { libc::isatty(1) } != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "attach requires interactive stdin/stdout and /dev/tty",
+            ));
+        }
+        // SAFETY: a fixed NUL-terminated path and flags; fd ownership is
+        // transferred to OwnedFd only on success.
+        let fd = unsafe {
+            libc::open(
+                c"/dev/tty".as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut saved = std::mem::MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(fd.as_raw_fd(), saved.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let saved = unsafe { saved.assume_init() };
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let guard = RawMode { fd, saved, flags };
+        let mut raw = guard.saved;
+        unsafe {
+            libc::cfmakeraw(&mut raw);
+        }
+        if unsafe { libc::tcsetattr(guard.fd.as_raw_fd(), libc::TCSANOW, &raw) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe {
+            libc::fcntl(
+                guard.fd.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let io = AsyncFd::new(guard.fd.try_clone()?)?;
+        Ok(Self { io, raw: guard })
+    }
+
+    pub(crate) async fn read(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.io
+            .async_io(Interest::READABLE, |fd| {
+                let size =
+                    unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+                if size < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(size as usize)
+                }
+            })
+            .await
+    }
+
+    pub(crate) async fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let size = self
+                .io
+                .async_io(Interest::WRITABLE, |fd| {
+                    let size = unsafe {
+                        libc::write(
+                            fd.as_raw_fd(),
+                            bytes[offset..].as_ptr().cast(),
+                            bytes.len() - offset,
+                        )
+                    };
+                    if size < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(size as usize)
+                    }
+                })
+                .await?;
+            if size == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "operator TTY closed",
+                ));
+            }
+            offset += size;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn size(&self) -> Option<(u16, u16)> {
+        let mut size = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        if unsafe { libc::ioctl(self.raw.fd.as_raw_fd(), libc::TIOCGWINSZ, &mut size) } == 0
+            && size.ws_row > 0
+            && size.ws_col > 0
+        {
+            Some((size.ws_row.min(1000), size.ws_col.min(1000)))
+        } else {
+            None
+        }
+    }
+}

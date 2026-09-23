@@ -297,7 +297,11 @@ impl Gate {
 fn requires_approval(op: &crate::protocol::Operation) -> bool {
     matches!(
         op,
-        crate::protocol::Operation::Exec(_) | crate::protocol::Operation::Write { .. }
+        crate::protocol::Operation::Exec(_)
+            | crate::protocol::Operation::Write {
+                owner_token: None,
+                ..
+            }
     )
 }
 
@@ -402,7 +406,9 @@ fn render_prompt(
                 "env": args.env,
             }),
         ),
-        crate::protocol::Operation::Write { job_id, data, eof } => (
+        crate::protocol::Operation::Write {
+            job_id, data, eof, ..
+        } => (
             "write",
             None,
             Some(job_id.clone()),
@@ -622,6 +628,7 @@ mod tests {
                 job_id: "job-1".into(),
                 data: data.into(),
                 eof: false,
+                owner_token: None,
             },
         }
     }
@@ -640,6 +647,26 @@ mod tests {
         assert!(console.is_none());
         assert!(gate.check(&exec("session", &["echo", "ok"])).is_none());
         assert!(gate.check(&write_request("write", "echo ok\n")).is_none());
+    }
+
+    #[test]
+    fn operator_token_bypasses_per_input_prompt_only() {
+        let gate = Gate::new_for_test();
+        let mut operator = write_request("owner-write", "typed by operator\n");
+        if let Operation::Write { owner_token, .. } = &mut operator.op {
+            *owner_token = Some("test-owner-capability".into());
+        }
+        assert!(gate.check(&operator).is_none());
+        assert!(lock(&gate.inner).records.is_empty());
+        assert_eq!(
+            error_code(
+                gate.check(&write_request("model-write", "model\n"))
+                    .unwrap()
+            ),
+            "APPROVAL_REQUIRED"
+        );
+        // The Connector, not this local Gate, verifies the operator token
+        // against a currently owned PTY before accepting its Write.
     }
 
     #[test]
