@@ -14,7 +14,7 @@ mcp = ["controller", "dep:rmcp"]
 
 [dependencies]
 base64 = "0.22"
-snow = { version = "0.10", default-features = false, features = ["std", "ring-resolver"] }
+snow = { version = "0.10", default-features = false, features = ["std", "ring-resolver", "use-curve25519", "use-chacha20poly1305", "use-sha2"] }
 anyhow = "1.0"
 clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

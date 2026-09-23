@@ -21,8 +21,25 @@ pub struct Request {
 pub enum Operation {
     Info,
     Exec(Exec),
-    Read { job_id: String, #[serde(default)] cursor: u64 },
-    Cancel { job_id: String },
+    Read {
+        job_id: String,
+        #[serde(default)]
+        cursor: u64,
+    },
+    Cancel {
+        job_id: String,
+    },
+    Write {
+        job_id: String,
+        data: String,
+        #[serde(default)]
+        eof: bool,
+    },
+    Resize {
+        job_id: String,
+        rows: u16,
+        cols: u16,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,8 +52,14 @@ pub struct Exec {
     pub env: BTreeMap<String, String>,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub stdin: bool,
+    #[serde(default)]
+    pub pty: bool,
 }
-fn default_timeout() -> u64 { 60_000 }
+fn default_timeout() -> u64 {
+    60_000
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reply {
@@ -45,13 +68,27 @@ pub struct Reply {
     pub error: Option<Fault>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Fault { pub code: String, pub message: String }
+pub struct Fault {
+    pub code: String,
+    pub message: String,
+}
 impl Reply {
     pub fn ok(id: &str, result: impl Serialize) -> Self {
-        Self { id: id.into(), result: Some(serde_json::to_value(result).expect("serializable result")), error: None }
+        Self {
+            id: id.into(),
+            result: Some(serde_json::to_value(result).expect("serializable result")),
+            error: None,
+        }
     }
     pub fn err(id: &str, code: &str, message: impl Into<String>) -> Self {
-        Self { id: id.into(), result: None, error: Some(Fault { code: code.into(), message: message.into() }) }
+        Self {
+            id: id.into(),
+            result: None,
+            error: Some(Fault {
+                code: code.into(),
+                message: message.into(),
+            }),
+        }
     }
 }
 
@@ -107,5 +144,9 @@ pub struct JobView {
 }
 
 pub fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 80 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    !id.is_empty()
+        && id.len() <= 80
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }

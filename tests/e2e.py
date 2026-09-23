@@ -14,6 +14,7 @@ import json
 import os
 import pathlib
 import select
+import shlex
 import signal
 import socket
 import stat
@@ -26,7 +27,8 @@ from typing import Any, Callable, Iterable, Optional
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-MAX_TOTAL_JOBS = 16
+MAX_TOTAL_JOBS = 64
+MAX_JOBS_PER_SESSION = 16
 TERMINAL_STATES = {"exited", "failed", "timed_out", "cancelled"}
 
 
@@ -229,8 +231,88 @@ class ManagedProcess:
                 pass
 
 
+class WebSocketCapture:
+    """Decode WebSocket text messages without changing the forwarded bytes.
+
+    The relay terminates WebSocket framing but must not terminate Noise.  This
+    parser gives the test the same view of the outer application frames that a
+    relay would have, including unmasking client-to-server frames.  It does
+    not parse or decrypt the JSON carried by a ``data`` frame.
+    """
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+        self.handshake_done = False
+        self.fragment_opcode: Optional[int] = None
+        self.fragment = bytearray()
+
+    def feed(self, data: bytes) -> list[bytes]:
+        self.buffer.extend(data)
+        messages: list[bytes] = []
+        if not self.handshake_done:
+            marker = self.buffer.find(b"\r\n\r\n")
+            if marker < 0:
+                # HTTP headers are bounded by the server/client handshake;
+                # avoid retaining arbitrary data if a peer is malformed.
+                if len(self.buffer) > 64 * 1024:
+                    self.buffer.clear()
+                return messages
+            del self.buffer[: marker + 4]
+            self.handshake_done = True
+
+        while True:
+            if len(self.buffer) < 2:
+                return messages
+            first, second = self.buffer[0], self.buffer[1]
+            opcode = first & 0x0F
+            masked = bool(second & 0x80)
+            length = second & 0x7F
+            header_len = 2
+            if length == 126:
+                if len(self.buffer) < 4:
+                    return messages
+                length = int.from_bytes(self.buffer[2:4], "big")
+                header_len = 4
+            elif length == 127:
+                if len(self.buffer) < 10:
+                    return messages
+                length = int.from_bytes(self.buffer[2:10], "big")
+                header_len = 10
+            mask_len = 4 if masked else 0
+            total = header_len + mask_len + length
+            if total > 64 * 1024 * 1024:
+                self.buffer.clear()
+                return messages
+            if len(self.buffer) < total:
+                return messages
+
+            frame = bytes(self.buffer[:total])
+            del self.buffer[:total]
+            payload_start = header_len + mask_len
+            payload = bytearray(frame[payload_start:])
+            if masked:
+                mask = frame[header_len : header_len + 4]
+                for index in range(len(payload)):
+                    payload[index] ^= mask[index % 4]
+
+            final = bool(first & 0x80)
+            if opcode == 1:  # text
+                if final:
+                    messages.append(bytes(payload))
+                else:
+                    self.fragment_opcode = opcode
+                    self.fragment = payload
+            elif opcode == 0 and self.fragment_opcode == 1:
+                self.fragment.extend(payload)
+                if final:
+                    messages.append(bytes(self.fragment))
+                    self.fragment_opcode = None
+                    self.fragment.clear()
+            # Ping/Pong/Close and binary frames are deliberately ignored.
+
+
 class FaultProxy:
-    """A raw TCP forwarder that can cut existing connections and pause accepts."""
+    """A raw TCP forwarder that can cut connections and record outer WS frames."""
 
     def __init__(self, listen_port: int, target_port: int) -> None:
         self.listen_port = listen_port
@@ -239,6 +321,7 @@ class FaultProxy:
         self._blocked = threading.Event()
         self._lock = threading.Lock()
         self._connections: set[tuple[socket.socket, socket.socket]] = set()
+        self._captured_frames: list[tuple[str, bytes]] = []
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listener.bind(("127.0.0.1", listen_port))
@@ -269,13 +352,13 @@ class FaultProxy:
                 self._connections.add(pair)
             threading.Thread(
                 target=self._pump,
-                args=(pair, client, upstream),
+                args=(pair, client, upstream, "client->relay", WebSocketCapture()),
                 name="fault-proxy-c2s",
                 daemon=True,
             ).start()
             threading.Thread(
                 target=self._pump,
-                args=(pair, upstream, client),
+                args=(pair, upstream, client, "relay->client", WebSocketCapture()),
                 name="fault-proxy-s2c",
                 daemon=True,
             ).start()
@@ -302,12 +385,18 @@ class FaultProxy:
         pair: tuple[socket.socket, socket.socket],
         source: socket.socket,
         destination: socket.socket,
+        direction: str,
+        capture: WebSocketCapture,
     ) -> None:
         try:
             while not self._closed.is_set():
                 data = source.recv(65536)
                 if not data:
                     break
+                frames = capture.feed(data)
+                if frames:
+                    with self._lock:
+                        self._captured_frames.extend((direction, frame) for frame in frames)
                 destination.sendall(data)
         except OSError:
             pass
@@ -317,6 +406,14 @@ class FaultProxy:
     def active_count(self) -> int:
         with self._lock:
             return len(self._connections)
+
+    def clear_captured_frames(self) -> None:
+        with self._lock:
+            self._captured_frames.clear()
+
+    def captured_application_frames(self) -> list[tuple[str, bytes]]:
+        with self._lock:
+            return list(self._captured_frames)
 
     def drop_and_block(self) -> None:
         self._blocked.set()
@@ -408,12 +505,16 @@ class Session:
         require(controller["role"] == "controller", f"{self.name}: controller role not controller")
         require(relay["session_id"] == connector["session_id"] == controller["session_id"], f"{self.name}: session IDs differ")
         require(connector["target_id"] == controller["target_id"], f"{self.name}: target IDs differ")
+        require(isinstance(connector.get("channel_key"), str) and len(connector["channel_key"]) == 64, f"{self.name}: connector channel key missing")
+        require(connector["channel_key"] == controller.get("channel_key"), f"{self.name}: endpoint channel keys differ")
+        require("channel_key" not in relay, f"{self.name}: relay credential contains the end-to-end key")
         self.session_id = connector["session_id"]
         self.target_id = connector["target_id"]
         self.connector_token = connector["token"]
         self.controller_token = controller["token"]
 
-    def start(self) -> None:
+    def start_connector(self) -> None:
+        require(self.connector is None, f"{self.name}: connector already started")
         self.connector = ManagedProcess(
             [
                 str(self.binary),
@@ -429,6 +530,9 @@ class Session:
             f"{self.name}-connector",
         )
         wait_until(lambda: self.state_dir.is_dir(), 5.0, f"{self.name} state directory")
+
+    def start_controller(self, *, wait_for_connection: bool = True) -> None:
+        require(self.controller is None, f"{self.name}: controller already started")
         self.controller = ManagedProcess(
             [
                 str(self.binary),
@@ -443,6 +547,8 @@ class Session:
         )
         wait_until(lambda: self.socket_path.exists(), 5.0, f"{self.name} controller socket")
         require(mode(self.socket_path) == 0o600, f"{self.name}: controller socket mode is {oct(mode(self.socket_path))}, expected 0600")
+        if not wait_for_connection:
+            return
         wait_until(lambda: self.try_info()[0] is not None, 20.0, f"{self.name} controller/connector connection")
         info = self.info()
         self.incarnation = str(info["incarnation"])
@@ -450,7 +556,11 @@ class Session:
         require(info["target_id"] == self.target_id, f"{self.name}: info target mismatch")
         require(info["protocol"] == 1, f"{self.name}: unexpected protocol {info.get('protocol')!r}")
         require(info["approval"] == "session-approved", f"{self.name}: approval metadata mismatch")
-        require(info["end_to_end_encrypted"] is False, f"{self.name}: unexpected E2EE metadata")
+        require(info["end_to_end_encrypted"] is True, f"{self.name}: unexpected E2EE metadata")
+
+    def start(self) -> None:
+        self.start_connector()
+        self.start_controller()
 
     def try_info(self) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
         cp = run_cli(self.binary, ["info", "--socket", str(self.socket_path)], timeout=10.0)
@@ -484,6 +594,8 @@ class Session:
         timeout_ms: int = 60000,
         env: Optional[dict[str, str]] = None,
         incarnation: Optional[str] = None,
+        stdin: bool = False,
+        pty: bool = False,
         timeout: float = 20.0,
     ) -> dict[str, Any]:
         args = [
@@ -501,6 +613,10 @@ class Session:
         ]
         for key, value in (env or {}).items():
             args.extend(["--env", f"{key}={value}"])
+        if stdin:
+            args.append("--stdin")
+        if pty:
+            args.append("--pty")
         args.extend(["--", *argv])
         return self._call(args, f"{self.name} exec {request_id}", timeout=timeout)
 
@@ -515,6 +631,39 @@ class Session:
         return self._call(
             ["cancel", "--socket", str(self.socket_path), "--job", job_id],
             f"{self.name} cancel {job_id}",
+            timeout=20.0,
+        )
+
+    def write(self, job_id: str, request_id: str, data: str = "", *, eof: bool = False) -> dict[str, Any]:
+        args = [
+            "write",
+            "--socket",
+            str(self.socket_path),
+            "--job",
+            job_id,
+            "--request-id",
+            request_id,
+            "--data",
+            data,
+        ]
+        if eof:
+            args.append("--eof")
+        return self._call(args, f"{self.name} write {request_id}", timeout=20.0)
+
+    def resize(self, job_id: str, rows: int, cols: int) -> dict[str, Any]:
+        return self._call(
+            [
+                "resize",
+                "--socket",
+                str(self.socket_path),
+                "--job",
+                job_id,
+                "--rows",
+                str(rows),
+                "--cols",
+                str(cols),
+            ],
+            f"{self.name} resize {job_id} {rows}x{cols}",
             timeout=20.0,
         )
 
@@ -539,9 +688,16 @@ class Suite:
         self.lease_secs = lease_secs
         self.jobs_started = 0
         self._known_jobs: set[str] = set()
+        self._known_jobs_by_session: dict[str, set[str]] = collections.defaultdict(set)
         self.notes: list[str] = []
 
-    def register_reply(self, payload: dict[str, Any], context: str) -> dict[str, Any]:
+    def register_reply(
+        self,
+        payload: dict[str, Any],
+        context: str,
+        *,
+        session: Optional[Session] = None,
+    ) -> dict[str, Any]:
         require(payload.get("error") is None, f"{context}: unexpected error {payload.get('error')}")
         result = payload.get("result")
         require(isinstance(result, dict), f"{context}: expected object result, got {result!r}")
@@ -550,6 +706,14 @@ class Suite:
             self._known_jobs.add(job_id)
             self.jobs_started += 1
             require(self.jobs_started <= MAX_TOTAL_JOBS, f"test exceeded {MAX_TOTAL_JOBS} total started jobs")
+        if session is not None and isinstance(job_id, str):
+            jobs = self._known_jobs_by_session[session.name]
+            if job_id not in jobs:
+                jobs.add(job_id)
+                require(
+                    len(jobs) <= MAX_JOBS_PER_SESSION,
+                    f"{session.name}: test observed more than {MAX_JOBS_PER_SESSION} jobs in one session",
+                )
         return result
 
     def expect_error(self, payload: dict[str, Any], code: str, context: str) -> None:
@@ -605,6 +769,37 @@ def assert_job_identity(view: dict[str, Any], expected: dict[str, Any], context:
         require(view.get(key) == expected.get(key), f"{context}: {key} changed: {view.get(key)!r} != {expected.get(key)!r}")
 
 
+def read_until_text(
+    suite: Suite,
+    session: Session,
+    job_id: str,
+    marker: str,
+    *,
+    cursor: int = 0,
+    timeout: float = 20.0,
+) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
+    deadline = time.monotonic() + timeout
+    events: list[dict[str, Any]] = []
+    last: Optional[dict[str, Any]] = None
+    while time.monotonic() < deadline:
+        payload = session.read(job_id, cursor)
+        view = suite.register_read(payload, f"{session.name} read {job_id} while waiting for {marker}")
+        last = view
+        batch = view.get("events")
+        require(isinstance(batch, list), f"{session.name}: read events is not a list")
+        events.extend(batch)
+        next_cursor = view.get("next_cursor")
+        require(isinstance(next_cursor, int) and next_cursor >= cursor, f"{session.name}: cursor regressed {cursor}->{next_cursor}")
+        cursor = next_cursor
+        output = "".join(event.get("text", "") for event in events)
+        if marker in output:
+            return view, events, cursor
+        if view.get("state") in TERMINAL_STATES:
+            break
+        time.sleep(0.05)
+    raise E2EFailure(f"{session.name}: job {job_id} did not emit {marker!r}; last={last}; events={events!r}")
+
+
 def process_exists(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -621,6 +816,119 @@ def load_json(path: pathlib.Path) -> dict[str, Any]:
     value = json.loads(path.read_text())
     require(isinstance(value, dict), f"{path}: expected JSON object")
     return value
+
+
+def replace_channel_key(path: pathlib.Path) -> None:
+    """Replace an endpoint key atomically while retaining its private mode."""
+    value = load_json(path)
+    key = value.get("channel_key")
+    require(isinstance(key, str) and len(key) == 64, f"{path}: cannot mutate missing channel key")
+    replacement = ("0" if key[0] != "0" else "1") + key[1:]
+    value["channel_key"] = replacement
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+    require(mode(path) == 0o600, f"{path}: mutated credential mode is not 0600")
+
+
+def relay_admin(
+    suite: Suite,
+    admin_socket: pathlib.Path,
+    *,
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    args = ["sessions", "--admin-socket", str(admin_socket)] if session_id is None else [
+        "revoke",
+        "--admin-socket",
+        str(admin_socket),
+        "--session",
+        session_id,
+    ]
+    cp = run_cli(suite.binary, args, timeout=15.0)
+    payload = parse_json_line(cp.stdout, f"relay admin {'status' if session_id is None else 'revoke'}")
+    require(cp.returncode == 0, f"relay admin failed: {payload}; stderr={text(cp.stderr)!r}")
+    return payload
+
+
+class RawWebSocket:
+    """Minimal client used only for relay/Noise negative-path tests."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self.sock = sock
+
+    @classmethod
+    def connect(
+        cls,
+        host: str,
+        port: int,
+        path: str,
+        token: str,
+        instance: str,
+        *,
+        timeout: float = 4.0,
+    ) -> "RawWebSocket":
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            "\r\n".join(
+                [
+                    f"GET {path} HTTP/1.1",
+                    f"Host: {host}:{port}",
+                    "Upgrade: websocket",
+                    "Connection: Upgrade",
+                    "Sec-WebSocket-Version: 13",
+                    f"Sec-WebSocket-Key: {key}",
+                    f"Authorization: Bearer {token}",
+                    f"X-Agent-Tunnel-Instance: {instance}",
+                ]
+            )
+            + "\r\n\r\n"
+        ).encode("ascii")
+        sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            sock.sendall(request)
+            response = bytearray()
+            while b"\r\n\r\n" not in response and len(response) < 65536:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response.extend(chunk)
+            header = bytes(response).split(b"\r\n\r\n", 1)[0]
+            first = header.split(b"\r\n", 1)[0].decode("ascii", "replace")
+            pieces = first.split()
+            require(len(pieces) >= 2, f"malformed raw WebSocket response: {first!r}")
+            status = int(pieces[1])
+            require(status == 101, f"raw WebSocket upgrade returned HTTP {status}: {first!r}")
+            sock.settimeout(timeout)
+            return cls(sock)
+        except BaseException:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
+
+    def send_text(self, value: bytes | str) -> None:
+        payload = value.encode("utf-8") if isinstance(value, str) else value
+        mask = os.urandom(4)
+        if len(payload) < 126:
+            header = bytes((0x81, 0x80 | len(payload)))
+        elif len(payload) < 65536:
+            header = bytes((0x81, 0xFE)) + len(payload).to_bytes(2, "big")
+        else:
+            header = bytes((0x81, 0xFF)) + len(payload).to_bytes(8, "big")
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self.sock.sendall(header + mask + masked)
+
+    def close(self) -> None:
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
 
 def websocket_handshake(
@@ -831,7 +1139,18 @@ def test_primary_operations(suite: Suite, session: Session, workdir: pathlib.Pat
     big_view, big_events = suite.read_to_terminal(session, big["job_id"], timeout=25.0)
     require(big_view["state"] == "exited", f"large-output state is {big_view['state']!r}")
     require(big_view["output_truncated"] is True, "large output did not report truncation")
-    require(big_view["dropped_before_cursor"] is not None, "large output omitted dropped cursor metadata")
+    # dropped_before_cursor describes THIS requested cursor, not global history.
+    # The draining helper finishes at the current cursor, so explicitly request
+    # the now-stale zero cursor to verify the gap and its continuation boundary.
+    stale = suite.register_read(session.read(big["job_id"], 0), "stale large-output cursor")
+    require(isinstance(stale["dropped_before_cursor"], int) and stale["dropped_before_cursor"] > 0,
+            "stale large-output cursor omitted dropped range metadata")
+    require(stale["events"] and stale["events"][0]["seq"] == stale["dropped_before_cursor"],
+            "gap metadata did not identify the first retained output event")
+    require(sum(len(e["text"].encode()) for e in stale["events"]) <= 32768,
+            "aggregate read exceeded MAX_READ")
+    continued = suite.register_read(session.read(big["job_id"], stale["next_cursor"]), "continued retained output")
+    require(continued["dropped_before_cursor"] is None, "valid retained cursor falsely reported a gap")
     big_text = "".join(event["text"] for event in big_events)
     require(len(big_text) > 0 and set(big_text) <= {"B"}, "large output was altered unexpectedly")
     require(all(len(event["text"]) <= 32768 for event in big_events), "read exceeded MAX_READ boundary")
@@ -862,8 +1181,305 @@ def test_primary_operations(suite: Suite, session: Session, workdir: pathlib.Pat
         require(view["state"] == "exited", f"concurrent job did not exit: {view}")
 
 
+def test_pipe_stdin(suite: Suite, session: Session, workdir: pathlib.Path) -> None:
+    marker = "PIPE_INPUT_UNIQUE_E2E"
+    job = suite.register_reply(
+        session.exec(
+            "pipe-cat",
+            ["/bin/cat"],
+            cwd=workdir,
+            timeout_ms=30000,
+            stdin=True,
+        ),
+        "pipe cat job",
+        session=session,
+    )
+
+    first = session.write(job["job_id"], "pipe-write", marker + "\n")
+    require(first.get("error") is None, f"pipe first write failed: {first}")
+    duplicate = session.write(job["job_id"], "pipe-write", marker + "\n")
+    require(duplicate.get("error") is None, f"duplicate pipe write failed: {duplicate}")
+    eof = session.write(job["job_id"], "pipe-eof", eof=True)
+    require(eof.get("error") is None, f"pipe EOF failed: {eof}")
+
+    view, events = suite.read_to_terminal(session, job["job_id"], timeout=15.0)
+    output = "".join(event["text"] for event in events)
+    require(output.count(marker) == 1, f"duplicate write was delivered more than once: {output!r}")
+    require(view["state"] == "exited", f"pipe cat state is {view['state']!r}")
+
+
+def test_pty_shell(suite: Suite, session: Session, workdir: pathlib.Path) -> None:
+    nested = workdir / "pty-nested"
+    nested.mkdir(mode=0o700)
+    state_marker = "PTY_STATE_UNIQUE_E2E"
+    resize_marker = "PTY_RESIZE_UNIQUE_E2E"
+    job = suite.register_reply(
+        session.exec(
+            "pty-shell",
+            ["/bin/sh"],
+            cwd=workdir,
+            timeout_ms=60000,
+            stdin=True,
+            pty=True,
+        ),
+        "PTY shell job",
+        session=session,
+    )
+
+    state_command = (
+        f"cd {shlex.quote(str(nested))}; "
+        "export E2E_PTY_ENV=present; "
+        f"printf '{state_marker}|cwd=%s|env=%s\\n' \"$PWD\" \"$E2E_PTY_ENV\""
+    )
+    session.write(job["job_id"], "pty-state", state_command + "\n")
+    _, state_events, cursor = read_until_text(suite, session, job["job_id"], state_marker, timeout=15.0)
+    state_output = "".join(event["text"] for event in state_events)
+    require(
+        f"{state_marker}|cwd={nested}|env=present" in state_output,
+        f"PTY did not preserve cd/export state: {state_output!r}",
+    )
+
+    resized = session.resize(job["job_id"], rows=40, cols=100)
+    require(resized.get("error") is None, f"PTY resize failed: {resized}")
+    session.write(
+        job["job_id"],
+        "pty-size",
+        f"printf '{resize_marker}|'; stty size\n",
+    )
+    _, resize_events, cursor = read_until_text(
+        suite,
+        session,
+        job["job_id"],
+        resize_marker + "|40 100",
+        cursor=cursor,
+        timeout=15.0,
+    )
+    resize_output = "".join(event["text"] for event in resize_events)
+    require(resize_marker + "|40 100" in resize_output, f"PTY size output did not reflect resize: {resize_output!r}")
+
+    session.write(job["job_id"], "pty-cancel-command", "sleep 30\n")
+    cancel = session.cancel(job["job_id"])
+    require(cancel.get("error") is None, f"PTY cancel failed: {cancel}")
+    terminal, _ = suite.read_to_terminal(session, job["job_id"], timeout=15.0)
+    require(terminal["state"] == "cancelled", f"PTY shell state is {terminal['state']!r}")
+    require(terminal["termination_reason"] == "cancelled", f"PTY shell reason is {terminal['termination_reason']!r}")
+
+
+def test_wire_confidentiality(
+    suite: Suite,
+    session: Session,
+    proxy: FaultProxy,
+    workdir: pathlib.Path,
+) -> None:
+    marker = "E2EE_OUTER_WIRE_UNIQUE_OUTPUT_MARKER"
+    proxy.clear_captured_frames()
+    # Capture a NEW handshake, not just already-established encrypted data.
+    proxy.drop_and_block()
+    wait_until(lambda: proxy.active_count() == 0, 5.0, "confidentiality probe disconnect")
+    proxy.release()
+    wait_until(lambda: session.try_info()[0] is not None, 20.0, "confidentiality probe re-handshake")
+    job = suite.register_reply(
+        session.exec(
+            "e2ee-wire-marker",
+            [sys.executable, "-c", f"print({marker!r}, flush=True)"],
+            cwd=workdir,
+            timeout_ms=10000,
+        ),
+        "E2EE wire marker job",
+        session=session,
+    )
+    view, events = suite.read_to_terminal(session, job["job_id"], timeout=15.0)
+    output = "".join(event["text"] for event in events)
+    require(marker in output, f"E2EE marker did not reach the controller: {output!r}")
+    require(view["state"] == "exited", f"E2EE wire marker state is {view['state']!r}")
+
+    wait_until(
+        lambda: len(proxy.captured_application_frames()) >= 4,
+        5.0,
+        "captured Noise/WebSocket application frames",
+    )
+    frames = proxy.captured_application_frames()
+    frame_types: set[str] = set()
+    for direction, payload in frames:
+        try:
+            frame = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise E2EFailure(f"captured {direction} WebSocket payload is not JSON: {payload!r}") from exc
+        require(isinstance(frame, dict), f"captured {direction} frame is not an object: {frame!r}")
+        frame_type = frame.get("type")
+        require(isinstance(frame_type, str), f"captured frame has no type: {frame!r}")
+        require(frame_type in {"init", "response", "data", "relay_event"}, f"unexpected outer frame type: {frame!r}")
+        frame_types.add(frame_type)
+        require(marker.encode() not in payload, f"outer frame exposed the output marker: {direction} {payload!r}")
+        if frame_type == "data":
+            encoded = frame.get("data")
+            require(isinstance(encoded, str), f"captured data frame has invalid ciphertext: {frame!r}")
+            try:
+                ciphertext = base64.b64decode(encoded, validate=True)
+            except (ValueError, base64.binascii.Error) as exc:
+                raise E2EFailure(f"captured data frame is not base64: {frame!r}") from exc
+            require(marker.encode() not in ciphertext, "captured Noise data decoded to the plaintext output marker")
+    require({"init", "response", "data"}.issubset(frame_types), f"Noise frame types not observed: {frame_types!r}")
+    suite.notes.append("relay-side WebSocket capture observed only Noise outer frames; command output marker stayed confidential")
+
+
+def test_bad_channel_key(
+    suite: Suite,
+    session: Session,
+    proxy: FaultProxy,
+    workdir: pathlib.Path,
+) -> None:
+    replace_channel_key(session.controller_file)
+    session.start_connector()
+    session.start_controller(wait_for_connection=False)
+    marker = workdir / "bad-channel-key-marker"
+    proxy.clear_captured_frames()
+
+    def channel_error() -> Optional[dict[str, Any]]:
+        _, payload = session.try_info()
+        if payload and isinstance(payload.get("error"), dict):
+            return payload
+        return None
+
+    info_error = wait_until(channel_error, 15.0, "bad channel key to reject info")
+    suite.expect_error(info_error, "TARGET_OFFLINE", "bad channel key info")
+    wait_until(
+        # NNpsk0 authenticates the initiating message, so a wrong PSK may
+        # be rejected by the responder before any response reaches Controller.
+        lambda: session.connector is not None and "end-to-end authentication failed" in session.connector.logs(),
+        8.0,
+        "bad channel key rejected during authenticated handshake",
+    )
+
+    attempted = session.exec(
+        "bad-channel-key-exec",
+        [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('must-not-run')"],
+        cwd=workdir,
+        timeout_ms=10000,
+    )
+    suite.expect_error(attempted, "TARGET_OFFLINE", "bad channel key exec")
+    require(not marker.exists(), "bad channel key unexpectedly fell back to plaintext execution")
+    for _, payload in proxy.captured_application_frames():
+        require(marker.name.encode() not in payload, "bad-key outer frame exposed the command marker")
+        try:
+            frame = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(frame, dict) and frame.get("type") == "data" and isinstance(frame.get("data"), str):
+            try:
+                decoded = base64.b64decode(frame["data"], validate=True)
+            except (ValueError, base64.binascii.Error):
+                continue
+            require(str(marker).encode() not in decoded, "bad-key frame contained an unencrypted command")
+
+    session.stop()
+
+
+def test_session_job_quota(
+    suite: Suite,
+    quota: Session,
+    peer: Session,
+    workdir: pathlib.Path,
+) -> None:
+    for index in range(MAX_JOBS_PER_SESSION):
+        job = suite.register_reply(
+            quota.exec(
+                f"quota-{index:02d}",
+                ["/bin/true"],
+                cwd=workdir,
+                timeout_ms=10000,
+            ),
+            f"quota job {index}",
+            session=quota,
+        )
+        view, _ = suite.read_to_terminal(quota, job["job_id"], timeout=10.0)
+        require(view["state"] == "exited", f"quota job {index} state is {view['state']!r}")
+
+    over_limit = quota.exec(
+        "quota-over-limit",
+        ["/bin/echo", "must-not-run"],
+        cwd=workdir,
+        timeout_ms=10000,
+    )
+    suite.expect_error(over_limit, "RESOURCE_LIMIT", "seventeenth-session-job quota")
+
+    # Filling one Connector's durable request table must not consume another
+    # session's independent 16-job budget.
+    peer_job = suite.register_reply(
+        peer.exec("other-session-after-quota", ["/bin/true"], cwd=workdir, timeout_ms=10000),
+        "other session after quota",
+        session=peer,
+    )
+    peer_view, _ = suite.read_to_terminal(peer, peer_job["job_id"], timeout=10.0)
+    require(peer_view["state"] == "exited", f"other session was affected by quota session: {peer_view}")
+
+
+def test_role_token_theft(
+    suite: Suite,
+    session: Session,
+    proxy_port: int,
+    workdir: pathlib.Path,
+) -> None:
+    del suite  # This test must not obtain an authenticated application reply.
+    session.start_connector()
+    require(session.connector is not None, f"{session.name}: connector process missing")
+    session.connector.wait_for_log("connector transport connected", 10.0)
+    forged_marker = workdir / "role-token-forged-marker"
+    raw: Optional[RawWebSocket] = None
+    try:
+        raw = RawWebSocket.connect(
+            "127.0.0.1",
+            proxy_port,
+            f"/v1/control/{session.session_id}",
+            session.controller_token,
+            "stolen-controller-token-instance",
+        )
+        forged_request = {
+            "type": "request",
+            "version": 1,
+            "request": {
+                "id": "forged-without-psk",
+                "op": "exec",
+                "expected_incarnation": "forged-incarnation",
+                "argv": [
+                    "/bin/sh",
+                    "-c",
+                    f"printf {shlex.quote('ROLE_TOKEN_FORGED')} > {shlex.quote(str(forged_marker))}",
+                ],
+                "cwd": str(workdir),
+                "env": {},
+                "timeout_ms": 10000,
+                "stdin": False,
+                "pty": False,
+            },
+        }
+        # The outer frame is syntactically a Noise data frame, but its payload
+        # is deliberately not a Noise ciphertext.  Do not send a plaintext
+        # Request as if the relay routed it directly.
+        fake_ciphertext = base64.b64encode(json.dumps(forged_request, separators=(",", ":")).encode()).decode()
+        raw.send_text(json.dumps({"type": "data", "data": fake_ciphertext}, separators=(",", ":")))
+        time.sleep(0.5)
+        require(not forged_marker.exists(), "a stolen role token forged a command without the channel PSK")
+
+        session.start_controller(wait_for_connection=False)
+
+        def legitimate_controller_blocked() -> Optional[dict[str, Any]]:
+            _, payload = session.try_info()
+            if payload and isinstance(payload.get("error"), dict):
+                return payload
+            return None
+
+        blocked = wait_until(legitimate_controller_blocked, 15.0, "role-token theft DoS")
+        require(blocked["error"]["code"] == "TARGET_OFFLINE", f"stolen token did not only cause DoS: {blocked}")
+    finally:
+        if raw is not None:
+            raw.close()
+        session.stop()
+
+
 def test_transport_reconnect(suite: Suite, session: Session, proxy: FaultProxy, workdir: pathlib.Path) -> None:
     marker = workdir / "reconnect-count.txt"
+    proxy.clear_captured_frames()
     reconnect_code = (
         "import pathlib,time; "
         f"p=pathlib.Path({str(marker)!r}); "
@@ -910,6 +1526,26 @@ def test_transport_reconnect(suite: Suite, session: Session, proxy: FaultProxy, 
     require(final_view["state"] == "exited", f"reconnect job state is {final_view['state']!r}")
     captured = "".join(event["text"] for event in events)
     require("RECONNECT_START" in captured and "RECONNECT_END" in captured, f"read after reconnect lost output: {captured!r}")
+    reconnect_records = [
+        entry.get("record")
+        for entry in inspect_state(suite, session)
+        if isinstance(entry, dict)
+        and isinstance(entry.get("record"), dict)
+        and entry["record"].get("request_id") == "reconnect-idempotent"
+    ]
+    require(len(reconnect_records) == 1, f"reconnect created an implicit second request/job: {reconnect_records!r}")
+
+    wait_until(
+        lambda: len(proxy.captured_application_frames()) >= 8,
+        5.0,
+        "Noise re-handshake frames after transport reconnect",
+    )
+    reconnect_types = {
+        json.loads(payload).get("type")
+        for _, payload in proxy.captured_application_frames()
+        if payload.startswith(b"{")
+    }
+    require({"init", "response", "data"}.issubset(reconnect_types), f"reconnect did not carry Noise frames: {reconnect_types!r}")
 
     conflict = session.exec(
         "reconnect-idempotent",
@@ -934,14 +1570,21 @@ def wait_for_record(
     session: Session,
     job_id: str,
     timeout: float,
+    *,
+    state: Optional[str] = None,
 ) -> dict[str, Any]:
     def find() -> Optional[dict[str, Any]]:
         for entry in inspect_state(suite, session):
-            if isinstance(entry, dict) and isinstance(entry.get("record"), dict) and entry["record"].get("job_id") == job_id:
+            if (
+                isinstance(entry, dict)
+                and isinstance(entry.get("record"), dict)
+                and entry["record"].get("job_id") == job_id
+                and (state is None or entry["record"].get("state") == state)
+            ):
                 return entry
         return None
 
-    return wait_until(find, timeout, f"state record {job_id}")
+    return wait_until(find, timeout, f"state record {job_id} state={state or 'any'}")
 
 
 def test_controller_death_lease(suite: Suite, session: Session, workdir: pathlib.Path) -> None:
@@ -957,7 +1600,7 @@ def test_controller_death_lease(suite: Suite, session: Session, workdir: pathlib
     pid = int(job["pid"])
     wait_until(lambda: process_exists(pid), 3.0, "controller-death child process")
     session.stop_controller()
-    entry = wait_for_record(suite, session, job["job_id"], suite.lease_secs + 8.0)
+    entry = wait_for_record(suite, session, job["job_id"], suite.lease_secs + 8.0, state="cancelled")
     record = entry["record"]
     for key in ("session_id", "target_id", "incarnation", "job_id", "request_id", "pid", "pgid", "updated_at"):
         require(key in record, f"lease state record omitted {key}")
@@ -986,13 +1629,105 @@ def test_connector_exit_cleanup(suite: Suite, session: Session, workdir: pathlib
     pid = int(job["pid"])
     wait_until(lambda: process_exists(pid), 3.0, "connector-exit child process")
     session.stop_connector()
-    entry = wait_for_record(suite, session, job["job_id"], 8.0)
+    entry = wait_for_record(suite, session, job["job_id"], 8.0, state="cancelled")
     record = entry["record"]
     require(record["state"] == "cancelled", f"connector exit did not cancel job: {record}")
     require(record["termination_reason"] == "cancelled", f"connector exit reason: {record}")
     require(record["request_id"] == "connector-exit-cleanup", "connector exit record request mismatch")
     require(not process_exists(pid), f"connector exit left job PID {pid} running")
     require(session.controller is not None and session.controller.poll() is None, "controller died while testing connector exit")
+
+
+def test_revocation_and_restart_marker(
+    suite: Suite,
+    session: Session,
+    proxy: FaultProxy,
+    proxy_port: int,
+    admin_socket: pathlib.Path,
+    relay: ManagedProcess,
+    relay_args: list[str],
+    workdir: pathlib.Path,
+) -> None:
+    status = relay_admin(suite, admin_socket)
+    sessions = status.get("sessions")
+    require(isinstance(sessions, list), f"relay sessions result is not a list: {status}")
+    for item in sessions:
+        require(isinstance(item, dict), f"relay status contains malformed session metadata: {item!r}")
+        require("token" not in item and "channel_key" not in item, f"relay status disclosed credential material: {item!r}")
+    metadata = next((item for item in sessions if isinstance(item, dict) and item.get("session_id") == session.session_id), None)
+    require(isinstance(metadata, dict), f"relay status omitted revoke test session: {status}")
+    require(metadata.get("revoked") is False, f"fresh session unexpectedly revoked: {metadata}")
+    require(metadata.get("connector_connected") is True, f"revoke test connector is not connected: {metadata}")
+    require(metadata.get("controller_connected") is True, f"revoke test controller is not connected: {metadata}")
+
+    job = suite.register_reply(
+        session.exec(
+            "revocation-running-job",
+            [sys.executable, "-c", "import time; print('revoke-running', flush=True); time.sleep(60)"],
+            cwd=workdir,
+            timeout_ms=60000,
+        ),
+        "revocation running job",
+        session=session,
+    )
+    pid = int(job["pid"])
+    wait_until(lambda: process_exists(pid), 3.0, "revocation test child process")
+
+    revoked = relay_admin(suite, admin_socket, session_id=session.session_id)
+    require(revoked.get("session_id") == session.session_id, f"revoke session mismatch: {revoked}")
+    require(revoked.get("revoked") is True, f"revoke did not return revoked=true: {revoked}")
+    require(revoked.get("persisted") is True, f"revoke did not persist the marker: {revoked}")
+
+    marker = pathlib.Path(str(session.relay_file) + ".revoked")
+    require(marker.is_file(), f"revocation marker was not created: {marker}")
+    require(mode(marker) == 0o600, f"revocation marker mode is {oct(mode(marker))}, expected 0600")
+    require(marker.read_text() == session.session_id, f"revocation marker content mismatch: {marker.read_text()!r}")
+
+    status_after = relay_admin(suite, admin_socket)
+    sessions_after = status_after.get("sessions")
+    require(isinstance(sessions_after, list), f"relay sessions after revoke is not a list: {status_after}")
+    metadata_after = next((item for item in sessions_after if isinstance(item, dict) and item.get("session_id") == session.session_id), None)
+    require(isinstance(metadata_after, dict) and metadata_after.get("revoked") is True, f"relay status did not retain revoked=true: {status_after}")
+
+    for route, token, instance in (
+        (f"/v1/connect/{session.session_id}", session.connector_token, "revoked-connector-retry"),
+        (f"/v1/control/{session.session_id}", session.controller_token, "revoked-controller-retry"),
+    ):
+        http_status, _ = websocket_handshake("127.0.0.1", proxy_port, route, token, instance)
+        require(http_status == 401, f"revoked session accepted {route} retry with HTTP {http_status}")
+
+    # Revoke closes the transports, but the Connector owns the child until its
+    # remaining authenticated controller lease expires.  Verify cleanup within
+    # that bounded window rather than assuming an instantaneous kill.
+    entry = wait_for_record(suite, session, job["job_id"], suite.lease_secs + 8.0, state="cancelled")
+    record = entry["record"]
+    require(record["state"] == "cancelled", f"revoked running job state is {record}")
+    require(record["termination_reason"] == "cancelled", f"revoked running job reason is {record}")
+    require(not process_exists(pid), f"revocation left child PID {pid} running")
+    session.stop()
+
+    # A restarted relay must reject every old session-file set containing the
+    # durable marker, rather than silently forgetting the revocation.
+    relay.terminate()
+    restarted = ManagedProcess(relay_args, "relay-restart-revoked")
+    try:
+        wait_until(
+            lambda: restarted.poll() is not None,
+            5.0,
+            "relay restart to reject revoked session file",
+        )
+        require(restarted.poll() != 0, "relay restarted successfully with a revoked session file")
+        wait_until(
+            lambda: "durable revocation marker" in restarted.logs(),
+            2.0,
+            "relay restart durable-marker diagnostic",
+        )
+        require(
+            "durable revocation marker" in restarted.logs(),
+            f"relay restart did not report the durable marker refusal: {restarted.logs()}",
+        )
+    finally:
+        restarted.terminate()
 
 
 class McpProbe:
@@ -1055,7 +1790,15 @@ def test_mcp(suite: Suite, session: Session) -> None:
             require("error" not in tools, f"MCP {version}: tools/list error {tools}")
             tool_items = tools.get("result", {}).get("tools", [])
             names = {item.get("name") for item in tool_items if isinstance(item, dict)}
-            require({"remote_info", "remote_exec", "remote_read", "remote_cancel"}.issubset(names), f"MCP tools missing: {names!r}")
+            require(
+                {"remote_info", "remote_exec", "remote_read", "remote_cancel", "remote_write", "remote_resize"}.issubset(names),
+                f"MCP tools missing: {names!r}",
+            )
+            remote_exec = next(item for item in tool_items if item.get("name") == "remote_exec")
+            exec_schema = remote_exec.get("inputSchema", {})
+            exec_properties = exec_schema.get("properties", {})
+            require(exec_properties.get("stdin", {}).get("default") is False, f"MCP remote_exec stdin default changed: {exec_schema!r}")
+            require(exec_properties.get("pty", {}).get("default") is False, f"MCP remote_exec pty default changed: {exec_schema!r}")
             call = probe.request(3, "tools/call", {"name": "remote_info", "arguments": {}})
             require("error" not in call, f"MCP {version}: tools/call JSON-RPC error {call}")
             call_result = call.get("result")
@@ -1098,35 +1841,81 @@ def main() -> int:
         proxy_port = pick_port()
         relay_url = f"ws://127.0.0.1:{proxy_port}/"
         primary = Session(binary, root / "primary", "e2e-primary", relay_url, args.lease_secs)
+        bad_key = Session(binary, root / "bad-key", "e2e-bad-key", relay_url, args.lease_secs)
+        quota = Session(binary, root / "quota", "e2e-quota", relay_url, args.lease_secs)
+        token_theft = Session(binary, root / "token-theft", "e2e-token-theft", relay_url, args.lease_secs)
         lease = Session(binary, root / "lease", "e2e-lease", relay_url, args.lease_secs)
         connector_exit = Session(binary, root / "connector-exit", "e2e-connector-exit", relay_url, args.lease_secs)
-        managed_sessions.extend([primary, lease, connector_exit])
+        revoke = Session(binary, root / "revoke", "e2e-revoke", relay_url, args.lease_secs)
+        managed_sessions.extend([primary, bad_key, quota, token_theft, lease, connector_exit, revoke])
         for session in managed_sessions:
             session.initialize()
 
         proxy = FaultProxy(proxy_port, relay_port)
+        admin_socket = root / "relay-admin.sock"
         relay_args = [str(binary), "relay", "--listen", f"127.0.0.1:{relay_port}"]
         for session in managed_sessions:
             relay_args.extend(["--session-file", str(session.relay_file)])
+        relay_args.extend(["--admin-socket", str(admin_socket)])
         relay = ManagedProcess(relay_args, "relay")
         try:
             relay.wait_for_log("relay listening on", 10.0)
+            wait_until(lambda: admin_socket.is_socket(), 5.0, "relay admin socket")
+            require(mode(admin_socket) == 0o600, f"relay admin socket mode is {oct(mode(admin_socket))}, expected 0600")
             primary.start()
+            print("RUN: test_init_and_role_isolation", flush=True)
             test_init_and_role_isolation(suite, primary, proxy_port)
 
             workdir = root / "work"
             workdir.mkdir(mode=0o700)
+            print("RUN: test_primary_operations", flush=True)
             test_primary_operations(suite, primary, workdir)
+            print("RUN: test_pipe_stdin", flush=True)
+            test_pipe_stdin(suite, primary, workdir)
+            print("RUN: test_pty_shell", flush=True)
+            test_pty_shell(suite, primary, workdir)
+            print("RUN: test_wire_confidentiality", flush=True)
+            test_wire_confidentiality(suite, primary, proxy, workdir)
+            print("RUN: test_transport_reconnect", flush=True)
             test_transport_reconnect(suite, primary, proxy, workdir)
+            print("RUN: test_mcp", flush=True)
             test_mcp(suite, primary)
+            print("RUN: test_bad_channel_key", flush=True)
+            test_bad_channel_key(suite, bad_key, proxy, workdir)
+
+            quota.start()
+            print("RUN: test_session_job_quota", flush=True)
+            test_session_job_quota(suite, quota, primary, workdir)
+
+            print("RUN: test_role_token_theft", flush=True)
+            test_role_token_theft(suite, token_theft, proxy_port, workdir)
 
             lease.start()
+            print("RUN: test_controller_death_lease", flush=True)
             test_controller_death_lease(suite, lease, workdir)
 
             connector_exit.start()
+            print("RUN: test_connector_exit_cleanup", flush=True)
             test_connector_exit_cleanup(suite, connector_exit, workdir)
 
-            print(f"PASS: standard-library end-to-end suite; started_jobs={suite.jobs_started}/{MAX_TOTAL_JOBS}")
+            revoke.start()
+            print("RUN: test_revocation_and_restart_marker", flush=True)
+            test_revocation_and_restart_marker(
+                suite,
+                revoke,
+                proxy,
+                proxy_port,
+                admin_socket,
+                relay,
+                relay_args,
+                workdir,
+            )
+
+            print(
+                "PASS: standard-library end-to-end suite; "
+                f"started_jobs={suite.jobs_started}/{MAX_TOTAL_JOBS}; "
+                f"per_session_quota={MAX_JOBS_PER_SESSION}"
+            )
             for note in suite.notes:
                 print(f"NOTE: {note}")
             return 0
