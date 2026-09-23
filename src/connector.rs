@@ -142,8 +142,11 @@ pub async fn run(
             eprintln!(
                 "connector transport disconnected; jobs retained only until controller lease / TTL"
             );
-        } else {
-            eprintln!("connector connection unavailable; retrying within lease");
+        } else if let Err(error) = &connect {
+            eprintln!(
+                "connector connection unavailable ({}); retrying within lease",
+                transport::safe_connect_error(error, &config)
+            );
         }
         attempt = (attempt + 1).min(4);
         let backoff = Duration::from_millis(250 * (1u64 << attempt));

@@ -2,7 +2,7 @@ use crate::{
     config::{EndpointConfig, relay_url},
     protocol::MAX_FRAME,
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
 #[cfg(any(feature = "controller", feature = "relay"))]
@@ -35,12 +35,45 @@ pub async fn connect(config: &EndpointConfig, instance: &str) -> Result<Ws> {
     req.headers_mut().insert("Authorization", auth);
     req.headers_mut()
         .insert("X-Agent-Tunnel-Instance", instance.parse()?);
-    // No redirect following; use native trust roots and normal certificate validation.
-    let (ws, _) = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio_tungstenite::connect_async_with_config(req, Some(ws_config()), true),
-    )
-    .await??;
+    // A deliberately explicit IP override helps a target whose authorized
+    // hostname cannot resolve locally. The WebSocket URL, HTTP Host header,
+    // TLS SNI and certificate verification still use the configured hostname.
+    // In particular this option MUST NOT permit ws:// on the public network.
+    let override_ip = match std::env::var("AGENT_TUNNEL_CONNECT_IP") {
+        Ok(text) => {
+            ensure!(
+                root.starts_with("wss://"),
+                "connection IP override requires wss://"
+            );
+            Some(
+                text.parse::<std::net::IpAddr>()
+                    .context("invalid AGENT_TUNNEL_CONNECT_IP")?,
+            )
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let (ws, _) = if let Some(ip) = override_ip {
+        let port = req.uri().port_u16().unwrap_or(443);
+        let socket = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::net::TcpStream::connect(std::net::SocketAddr::new(ip, port)),
+        )
+        .await??;
+        socket.set_nodelay(true)?;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::client_async_tls_with_config(req, socket, Some(ws_config()), None),
+        )
+        .await??
+    } else {
+        // No redirect following; use native trust roots and normal certificate validation.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::connect_async_with_config(req, Some(ws_config()), true),
+        )
+        .await??
+    };
     Ok(ws)
 }
 pub async fn send<S>(ws: &mut WebSocketStream<S>, packet: &impl serde::Serialize) -> Result<()>
@@ -105,4 +138,17 @@ pub async fn send_encrypted(
         send(ws, &frame).await?;
     }
     Ok(())
+}
+
+/// Keep transport errors diagnostic without disclosing either authentication
+/// secret or embedding raw terminal control characters in operator logs.
+pub fn safe_connect_error(error: &anyhow::Error, config: &EndpointConfig) -> String {
+    error
+        .to_string()
+        .replace(&config.token, "[role token redacted]")
+        .replace(&config.channel_key, "[channel key redacted]")
+        .chars()
+        .flat_map(char::escape_default)
+        .take(320)
+        .collect()
 }

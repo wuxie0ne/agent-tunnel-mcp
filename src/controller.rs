@@ -152,6 +152,12 @@ async fn network(
                 result = &mut connecting => break result,
             }
         };
+        if let Err(error) = &connected {
+            eprintln!(
+                "controller connection unavailable ({}); retrying within session",
+                transport::safe_connect_error(error, &config)
+            );
+        }
         if let Ok(mut ws) = connected {
             attempt = 0;
             eprintln!("controller transport connected; authenticating end-to-end channel");
