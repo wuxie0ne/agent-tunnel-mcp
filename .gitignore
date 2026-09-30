@@ -1,0 +1,8 @@
+/dist/
+/agent-tunnel
+/agent-tunnel-logs/
+*.log
+*.pid
+.env
+.coverage*
+__pycache__/
