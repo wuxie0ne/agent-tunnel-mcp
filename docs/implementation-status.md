@@ -12,6 +12,12 @@
 
 - 多目标中转：`go test -race ./internal/relay ./internal/relayproto` 通过；覆盖两目标/同名隔离、审核同意/拒绝、错误注册密钥、离线不排队、断线后继续一次执行、同实例原地址重连、中转重启新地址/原到期时间。转发丢失的已知未知结果转换为 MCP 工具错误（started=null），避免 SDK 丢弃 HTTP 502 body 后只显示 Bad Gateway；目标仍唯一授权/执行。
 
+- CLI/Quick 管理：使用真实 cloudflared 2026.3.0 完成公网短命令（SDK 模拟确认），一次记录耗时 5.889s；自带/精简最终制品还需重新检查。其余尝试出现入口未就绪及客户端域名 NXDOMAIN，尚不能以这些网络失败判断长命令功能。
+- 本地跨进程 relay：SDK 模拟确认后无输出运行 300s，正常返回结果，耗时 300.010s；二进制 SHA-256 `1e06a92ca26b66bc77e729658a667c701c50e8478f7b11be1c860e60a7bb9a1e`。后续小修改需另列最终制品检查。
+- cloudflared 来源：本机原始文件与官方 GitHub 2026.3.0 release asset digest 完全匹配；记录在 `validation-evidence/cloudflared-source.json`。官方下载尝试出现 403、SSL 超时/慢速中断，未把残缺下载用于发布。
+
+- 最终基础检查：当前 24 项顶层 Go 测试（含子用例）通过 `go test -race -timeout 60s ./...`，`go vet ./...` 通过。增加显式 null/0/未知字段校验、停止等待已接收 HTTP、保留 leader PID 至管道清理结束防复用，以及匿名 WebSocket 连接上限。
+
 ## 尚未验收
 
 真实 Agent 用户确认（G0）、两种公网入口长命令（G1）、发布物及完整故障矩阵仍未通过，不宣称首版已经完成。

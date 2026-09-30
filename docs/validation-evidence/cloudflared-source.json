@@ -1,0 +1,11 @@
+{
+  "release": "2026.3.0",
+  "published_at": "2026-03-09T14:17:29Z",
+  "asset_name": "cloudflared-linux-amd64",
+  "bytes": 39667364,
+  "official_digest": "sha256:4a9e50e6d6d798e90fcd01933151a90bf7edd99a0a55c28ad18f2e16263a5c30",
+  "local_source_sha256": "4a9e50e6d6d798e90fcd01933151a90bf7edd99a0a55c28ad18f2e16263a5c30",
+  "match": true,
+  "source_api": "https://api.github.com/repos/cloudflare/cloudflared/releases/tags/2026.3.0",
+  "scope": "GitHub official asset digest match; not an independent security/legal audit"
+}

@@ -41,18 +41,19 @@ func (p *peer) close()     { p.once.Do(func() { p.cancel(); p.c.Conn.CloseNow();
 func (p *peer) count() int { p.mu.Lock(); defer p.mu.Unlock(); return len(p.pending) }
 
 type Server struct {
-	Key, Boot string
-	mu        sync.Mutex
-	routes    map[string]*route
-	slots     chan struct{}
-	closed    bool
+	connections chan struct{}
+	Key, Boot   string
+	mu          sync.Mutex
+	routes      map[string]*route
+	slots       chan struct{}
+	closed      bool
 }
 
 func New(key string) (*Server, error) {
 	if len(key) < 16 || len(key) > 4096 {
 		return nil, errors.New("registration key must be 16..4096 characters")
 	}
-	return &Server{Key: key, Boot: target.ID(), routes: map[string]*route{}, slots: make(chan struct{}, 64)}, nil
+	return &Server{Key: key, Boot: target.ID(), routes: map[string]*route{}, slots: make(chan struct{}, 64), connections: make(chan struct{}, 32)}, nil
 }
 func Hash(s string) string   { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
 func equal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
@@ -79,6 +80,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.forward(w, r)
 }
 func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
+	select {
+	case s.connections <- struct{}{}:
+		defer func() { <-s.connections }()
+	default:
+		http.Error(w, "BUSY: relay connection limit", 503)
+		return
+	}
 	if r.Header.Get("Origin") != "" {
 		http.Error(w, "browser registration not allowed", 403)
 		return

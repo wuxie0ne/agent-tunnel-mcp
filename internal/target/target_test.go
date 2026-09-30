@@ -29,7 +29,9 @@ func node(t *testing.T, mode string) *Node {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 		defer cancel()
-		n.Stop(ctx)
+		if e := n.Stop(ctx); e != nil {
+			t.Error(e)
+		}
 	})
 	return n
 }
@@ -164,5 +166,37 @@ func TestHistoryExcludesOutputAndToken(t *testing.T) {
 	}
 	if bytes.Contains(raw, []byte(n.Token)) || bytes.Contains(raw, []byte("output-not-for-history")) {
 		t.Fatal("token")
+	}
+}
+
+func TestStopWaitsForAdmittedHTTP(t *testing.T) {
+	n := node(t, "allow")
+	if !n.HTTPBegin() {
+		t.Fatal("not admitted")
+	}
+	done := make(chan error, 1)
+	go func() { done <- n.Stop(context.Background()) }()
+	for i := 0; i < 100; i++ {
+		if n.Info()["connection_state"] == "stopping" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if n.HTTPBegin() {
+		t.Fatal("accepted after stop")
+	}
+	select {
+	case <-done:
+		t.Fatal("closed history before admitted HTTP finished")
+	default:
+	}
+	n.HTTPEnd()
+	select {
+	case e := <-done:
+		if e != nil {
+			t.Fatal(e)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("HTTP wait never released")
 	}
 }

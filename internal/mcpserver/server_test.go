@@ -31,7 +31,9 @@ func fixture(t *testing.T, mode string) (*target.Node, *httptest.Server) {
 		h.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		n.Stop(ctx)
+		if e := n.Stop(ctx); e != nil {
+			t.Error(e)
+		}
 	})
 	return n, h
 }

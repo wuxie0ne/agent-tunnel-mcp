@@ -18,6 +18,8 @@ import (
 
 const Protocol = "2026-07-28"
 
+var Version = "0.1.0-dev"
+
 type forwardingKey struct{}
 
 func WithForwardID(ctx context.Context, id string) context.Context {
@@ -28,11 +30,11 @@ func toolResult(r executor.Result) *mcp.CallToolResult {
 }
 func New(n *target.Node) http.Handler {
 	handler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
-		s := mcp.NewServer(&mcp.Implementation{Name: "agent-tunnel", Version: "0.1.0-dev"}, &mcp.ServerOptions{SupportedProtocolVersions: []string{Protocol}, Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}}, Instructions: "Commands run as the target OS user. Unknown/lost results must never be automatically retried. No background task or history retrieval tools."})
+		s := mcp.NewServer(&mcp.Implementation{Name: "agent-tunnel", Version: Version}, &mcp.ServerOptions{SupportedProtocolVersions: []string{Protocol}, Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}}, Instructions: "Commands run as the target OS user. Unknown/lost results must never be automatically retried. No background task or history retrieval tools."})
 		s.AddTool(&mcp.Tool{Name: "target_info", Description: "Target identity, connection state, permissions and resource limits; no system diagnostics.", InputSchema: map[string]any{"type": "object", "additionalProperties": false}}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return &mcp.CallToolResult{StructuredContent: n.Info(), Content: []mcp.Content{&mcp.TextContent{Text: "Target identity and limits"}}}, nil
 		})
-		s.AddTool(&mcp.Tool{Name: "exec", Description: "Execute one synchronous noninteractive command. Exactly one shell_command or program. No stdin, background tasks, output retrieval or cancellation tool. Lost responses may mean command executed: never automatically retry.", InputSchema: map[string]any{"type": "object", "properties": map[string]any{"shell_command": map[string]any{"type": "string"}, "program": map[string]any{"type": "string"}, "args": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "maxItems": 1024}, "cwd": map[string]any{"type": "string"}, "max_output_bytes": map[string]any{"type": "integer", "minimum": 1, "maximum": config.MaxOutput}}, "additionalProperties": false, "oneOf": []any{map[string]any{"required": []string{"shell_command"}, "not": map[string]any{"required": []string{"program"}}}, map[string]any{"required": []string{"program"}, "not": map[string]any{"required": []string{"shell_command"}}}}}}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		s.AddTool(&mcp.Tool{Name: "exec", Description: "Execute one synchronous noninteractive command. Exactly one shell_command or program. No stdin, background tasks, output retrieval or cancellation tool. Lost responses may mean command executed: never automatically retry.", InputSchema: map[string]any{"type": "object", "properties": map[string]any{"shell_command": map[string]any{"type": "string"}, "program": map[string]any{"type": "string"}, "args": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "maxItems": 1024}, "cwd": map[string]any{"type": "string"}, "max_output_bytes": map[string]any{"type": "integer", "minimum": 1, "maximum": config.MaxOutput}}, "additionalProperties": false, "oneOf": []any{map[string]any{"required": []string{"shell_command"}, "not": map[string]any{"anyOf": []any{map[string]any{"required": []string{"program"}}, map[string]any{"required": []string{"args"}}}}}, map[string]any{"required": []string{"program"}, "not": map[string]any{"required": []string{"shell_command"}}}}}}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			var in executor.Input
 			dec := json.NewDecoder(bytes.NewReader(req.Params.Arguments))
 			dec.DisallowUnknownFields()
@@ -62,7 +64,7 @@ func New(n *target.Node) http.Handler {
 						return toolResult(fail), nil
 					}
 					data, _ := json.MarshalIndent(spec, "", "  ")
-					return &mcp.CallToolResult{RequestState: state, InputRequests: mcp.InputRequestMap{"confirm": &mcp.ElicitParams{Mode: "form", Message: fmt.Sprintf("Approve command on %s (instance %s), mode review? Full request:\n%s", n.Config.Name, n.InstanceID, data), RequestedSchema: map[string]any{"type": "object", "properties": map[string]any{"confirm": map[string]any{"type": "boolean", "default": false}}, "required": []string{"confirm"}, "additionalProperties": false}}}}, nil
+					return &mcp.CallToolResult{RequestState: state, InputRequests: mcp.InputRequestMap{"confirm": &mcp.ElicitParams{Mode: "form", Message: fmt.Sprintf("Approve command on %s (instance %s), mode review, timeout %s, UID %d/GID %d? Full request:\n%s", n.Config.Name, n.InstanceID, spec.Timeout, spec.UID, spec.GID, data), RequestedSchema: map[string]any{"type": "object", "properties": map[string]any{"confirm": map[string]any{"type": "boolean", "default": false}}, "required": []string{"confirm"}, "additionalProperties": false}}}}, nil
 				}
 				response, ok := req.Params.InputResponses["confirm"].(*mcp.ElicitResult)
 				if ok && response.Action == "accept" {
@@ -119,7 +121,10 @@ func New(n *target.Node) http.Handler {
 			http.Error(w, "unsupported protocol: use 2026-07-28 JSON MRTR", http.StatusBadRequest)
 			return
 		}
-		n.HTTPBegin()
+		if !n.HTTPBegin() {
+			http.Error(w, "TARGET_STOPPED or TOKEN_EXPIRED", 503)
+			return
+		}
 		defer n.HTTPEnd()
 		b := NewBuffer()
 		handler.ServeHTTP(b, r)

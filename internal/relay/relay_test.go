@@ -52,7 +52,9 @@ func startNode(t *testing.T, base, mode, key string) (*target.Node, chan string)
 		}
 		shutdown, stop := context.WithTimeout(context.Background(), 5*time.Second)
 		defer stop()
-		n.Stop(shutdown)
+		if e := n.Stop(shutdown); e != nil {
+			t.Error(e)
+		}
 	})
 	return n, urls
 }

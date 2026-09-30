@@ -3,6 +3,7 @@ package executor
 import (
 	"agent-tunnel/internal/config"
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -76,5 +77,14 @@ func TestUTF8AndSplit(t *testing.T) {
 	output(&r, &a, &b, 8)
 	if !r.StdoutEncodingReplaced || len(r.Stdout)+len(r.Stderr) > 8 {
 		t.Fatal(r)
+	}
+}
+
+func TestExplicitInvalidJSON(t *testing.T) {
+	for _, raw := range []string{`null`, `{"program":"echo","max_output_bytes":0}`, `{"program":"echo","args":[null]}`, `{"shell_command":"true","args":[]}`, `{"program":"echo","cwd":""}`, `{"program":"echo","approved":true}`, `{"program":"echo","max_output_bytes":null}`} {
+		var in Input
+		if json.Unmarshal([]byte(raw), &in) == nil {
+			t.Fatalf("accepted %s", raw)
+		}
 	}
 }

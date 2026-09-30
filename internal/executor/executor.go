@@ -3,7 +3,9 @@
 package executor
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -303,6 +305,21 @@ func (runner Runner) Run(owner context.Context, s Spec) Result {
 		r.Status = "unknown"
 		r.Message = fmt.Sprintf("observe process: %v", observeErr)
 	}
+	// Keep the leader unreaped until pipe cleanup is complete. This permits
+	// safe group cleanup even when its main process exited before descendants.
+	select {
+	case <-drains:
+	case <-time.After(runner.DrainGrace):
+		if observeErr == nil && !terminated {
+			unix.Kill(-cmd.Process.Pid, unix.SIGTERM)
+			time.Sleep(runner.TermGrace)
+			unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
+		}
+		outR.Close()
+		errR.Close()
+		<-drains
+		r.CleanupStatus = "output_pipe_closed_descendants_not_guaranteed"
+	}
 	waitErr := cmd.Wait()
 	if cmd.ProcessState != nil {
 		code := cmd.ProcessState.ExitCode()
@@ -315,16 +332,57 @@ func (runner Runner) Run(owner context.Context, s Spec) Result {
 	} else if waitErr != nil {
 		r.Message = waitErr.Error()
 	}
-	select {
-	case <-drains:
-	case <-time.After(runner.DrainGrace):
-		outR.Close()
-		errR.Close()
-		<-drains
-		r.CleanupStatus = "output_pipe_closed_descendants_not_guaranteed"
-	}
+
 	output(&r, &a, &b, s.MaxOutputBytes)
 	r.EndTime = time.Now().UTC()
 	r.DurationMS = time.Since(start).Milliseconds()
 	return r
+}
+
+// Optional fields must be omitted, not silently coerced from null/zero. The
+// raw SDK handler delegates validation here; schema inference alone is not a guard.
+func (in *Input) UnmarshalJSON(data []byte) error {
+	type plain Input
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if fields == nil {
+		return errors.New("arguments must be an object")
+	}
+	for key, value := range fields {
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("%s cannot be null", key)
+		}
+	}
+	var p plain
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&p); err != nil {
+		return err
+	}
+	if _, ok := fields["max_output_bytes"]; ok && (p.MaxOutputBytes < 1 || p.MaxOutputBytes > config.MaxOutput) {
+		return errors.New("max_output_bytes must be 1..262144")
+	}
+	if _, ok := fields["cwd"]; ok && p.Cwd == "" {
+		return errors.New("specified cwd must be absolute and nonempty")
+	}
+	if p.ShellCommand != nil {
+		if _, ok := fields["args"]; ok {
+			return errors.New("args is only valid for program")
+		}
+	}
+	if raw, ok := fields["args"]; ok {
+		var args []json.RawMessage
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return err
+		}
+		for _, a := range args {
+			if bytes.Equal(bytes.TrimSpace(a), []byte("null")) {
+				return errors.New("argument cannot be null")
+			}
+		}
+	}
+	*in = Input(p)
+	return nil
 }

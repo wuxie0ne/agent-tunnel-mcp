@@ -30,6 +30,7 @@ type pending struct {
 }
 type record struct{ fingerprint [32]byte }
 type Node struct {
+	httpWG                 sync.WaitGroup
 	httpActive             int
 	Config                 config.Target
 	InstanceID, Token, Cwd string
@@ -262,6 +263,9 @@ func (n *Node) Info() map[string]any {
 		executionHealth = "disabled"
 	}
 	state := n.state
+	if n.stopping {
+		state = "stopping"
+	}
 	if n.Expired() {
 		state = "expired"
 	}
@@ -302,7 +306,7 @@ func (n *Node) Stop(ctx context.Context) error {
 	}
 	n.mu.Unlock()
 	done := make(chan struct{})
-	go func() { n.wg.Wait(); close(done) }()
+	go func() { n.wg.Wait(); n.httpWG.Wait(); close(done) }()
 	select {
 	case <-done:
 		return n.History.Close()
@@ -325,8 +329,17 @@ func (n *Node) AllowOrigin(origin string) bool {
 	return err == nil && u.Host != "" && origin == u.Scheme+"://"+u.Host
 }
 
-func (n *Node) HTTPBegin() { n.mu.Lock(); n.httpActive++; n.mu.Unlock() }
-func (n *Node) HTTPEnd()   { n.mu.Lock(); n.httpActive--; n.mu.Unlock() }
+func (n *Node) HTTPBegin() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopping || n.Expired() {
+		return false
+	}
+	n.httpActive++
+	n.httpWG.Add(1)
+	return true
+}
+func (n *Node) HTTPEnd() { n.mu.Lock(); n.httpActive--; n.mu.Unlock(); n.httpWG.Done() }
 func (n *Node) Idle() bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
