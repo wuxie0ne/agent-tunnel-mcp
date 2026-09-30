@@ -4,7 +4,7 @@
 
 **不是生产运维平台。不是沙箱。有效 URL/token 可代表目标运行身份的全部命令权限。** 公网 HTTP/WS 会暴露凭据、命令与结果；首版允许这一取舍，不提供端到端加密。
 
-当前是开发候选，不是已完成全部 P0 验收的正式发布。真实 Agent 用户确认、公网 IP+HTTP 及 Quick Tunnel 长命令的验收边界，见 `docs/implementation-status.md`。官方 SDK 测试和模拟确认不等于真实用户审核。
+当前是开发候选，不是已完成全部 P0 验收的正式发布。**已实测：Quick Tunnel 的 300 秒同步命令可能提前丢失响应，而目标仍执行并记录完成；长操作目前优先使用自部署中转，不要因丢失响应重试。没有静默缩短执行超时，也没有改成异步补取。**真实 Agent 用户确认、公网 IP+HTTP 及 Quick Tunnel 长命令的验收边界，见 `docs/implementation-status.md`。官方 SDK 测试和模拟确认不等于真实用户审核。
 
 ## 启动（以下交互命令为 fish）
 
@@ -116,6 +116,13 @@ python3 -B scripts/package.py --cloudflared /path/to/official/cloudflared --offi
 ```
 
 脚本验证原始校验值，再 `strip --strip-debug` 与 `upx --best --lzma`；不会处理系统已安装的原文件。输出 Linux amd64 自带/精简归档及 SHA256SUMS、BUILD-INFO、第三方许可。压缩后须真实 Quick Tunnel/MCP 功能测试，不能只凭 `--version` 或 UPX 完整性检查发布。已有同名归档须显式 `--force`。
+
+可选真实客户端界面验收：使用已安装的官方 Inspector 2.8.0、Playwright 和独立 headless Chrome，不自动安装、不改用户浏览器/全局客户端配置。
+
+```fish
+# 用安装了 Playwright 的开发 Python；按钮由自动化操作，不宣称真人点击
+python3 -B scripts/smoke-inspector.py --binary dist/agent-tunnel --inspector /path/to/inspector/clients/launcher/build/index.js
+```
 
 源码自身许可尚未指定，不由打包器擅自选择开源许可；保留依赖与 cloudflared 许可，不宣称第三方合规审计完成。
 

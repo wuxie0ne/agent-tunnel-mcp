@@ -1,8 +1,8 @@
 # agent-tunnel：Go 版整体规划设计
 
-日期：2026-09-30。状态：**设计方案；尚未实现，尚未完成真实客户端或公网验证**。
+日期：2026-09-30。状态：**已实施；部分真实客户端/公网场景已验证，完整验收未通过**。逐项证据见 `docs/implementation-status.md`。
 
-需求依据：`docs/go-requirements.md`。需求文档决定做什么，本文决定怎样以较小工程量实现；冲突时以需求为准，不能借设计静默删减 P0。本文不授权本轮开始开发、启动服务或提交代码。
+需求依据：`docs/go-requirements.md`。需求文档决定做什么，本文决定怎样以较小工程量实现；冲突时以需求为准，不能借设计静默删减 P0。后续用户已授权无人值守开发、验证与阶段性提交；设计中的范围变更仍须讨论。
 
 ## 1. 设计结论与原则
 
@@ -406,4 +406,4 @@ Quick 地址从经过验证的 `cloudflared` 输出/能力中取得，不开放�
 | R7 | Cloudflare Connection limits：代理时限及不可从其推定的 Quick 行为 | `https://developers.cloudflare.com/fundamentals/reference/connection-limits/` |
 | R8 | coder/websocket：候选内部通道库的官方仓库 | `https://github.com/coder/websocket` |
 
-当前仅核对需求、本地 Go 版本、引用的官方规范/文档和少量 SDK 选项说明。SDK 中仍有旧协议注释，不能据此推定新协议的审核已经可用。尚未下载依赖、运行协议原型、启动 Quick Tunnel/中转、操作真实客户端、构建发布物或验证进程/日志故障行为。
+制定设计时尚未运行验证。当前已锁定 Go SDK v1.8.0 并完成代码、测试、真实 Quick Tunnel 和官方 Inspector 界面部分验证及候选打包；具体 Source commit、哈希、失败与缺口见实施记录。不以旧协议注释、SDK 模拟测试或局部通过声称全量验收完成。

@@ -1,0 +1,93 @@
+{
+  "packaged-full-quick-short": {
+    "test": "public_quick_with_simulated_sdk_confirmation",
+    "real_agent_acceptance": false,
+    "evidence_dir": "/tmp/agent-tunnel-quick-97_0uayt",
+    "command_timeout": "2m",
+    "binary_sha256": "a6edc9fd99cd382ca4ed70968fd6ac08fe4477f33db702d8d83a514a1f5fc394",
+    "cloudflared_sha256": "9c8b68e77ae71e6aee980ed15484ad4164285d9e44493c095d7870a2c548830a",
+    "client_proxy": "mgraftcp",
+    "status": "passed",
+    "client_exit": 0,
+    "elapsed_seconds": 15.945,
+    "command_status": "exited",
+    "history_status": "ok",
+    "started": true,
+    "stdout_bytes": 11,
+    "target_exit": 0
+  },
+  "packaged-full-quick-default-timeout": {
+    "test": "public_quick_with_simulated_sdk_confirmation",
+    "real_agent_acceptance": false,
+    "evidence_dir": "/tmp/agent-tunnel-quick-n0kq89mu",
+    "command_timeout": "2m",
+    "binary_sha256": "a6edc9fd99cd382ca4ed70968fd6ac08fe4477f33db702d8d83a514a1f5fc394",
+    "cloudflared_sha256": "9c8b68e77ae71e6aee980ed15484ad4164285d9e44493c095d7870a2c548830a",
+    "client_proxy": "mgraftcp",
+    "status": "call_failed_or_tool_error",
+    "client_exit": 1,
+    "elapsed_seconds": 135.451,
+    "command_status": "timed_out",
+    "history_status": "ok",
+    "started": true,
+    "stdout_bytes": 0,
+    "target_exit": 0,
+    "assessment": "Expected COMMAND_TIMEOUT returned through public Quick Tunnel; helper exit 1 is a tool timeout result, not transport failure."
+  },
+  "packaged-full-quick-300s": {
+    "test": "public_quick_with_simulated_sdk_confirmation",
+    "real_agent_acceptance": false,
+    "evidence_dir": "/tmp/agent-tunnel-quick-4f4b1tl8",
+    "command_timeout": "6m",
+    "binary_sha256": "a6edc9fd99cd382ca4ed70968fd6ac08fe4477f33db702d8d83a514a1f5fc394",
+    "cloudflared_sha256": "9c8b68e77ae71e6aee980ed15484ad4164285d9e44493c095d7870a2c548830a",
+    "client_proxy": "mgraftcp",
+    "status": "call_failed_or_tool_error",
+    "client_exit": 1,
+    "elapsed_seconds": 138.343,
+    "local_completion": "exited",
+    "local_duration_ms": 300002,
+    "local_result_found": true,
+    "target_exit": 0,
+    "assessment": "Client lost result while local command completed once after 300 seconds; open synchronous long-command compatibility conflict."
+  },
+  "packaged-root-alpine": {
+    "test": "packaged_CGO0_in_readonly_Alpine_3_22_root",
+    "status": "passed",
+    "uid": 0,
+    "arch": "x86_64",
+    "source_commit": "82e8daf",
+    "evidence_dir": "/tmp/agent-tunnel-container-3o2gg19n"
+  },
+  "packaged-inspector-local-relay": {
+    "test": "official_Inspector_2_8_0_real_web_UI",
+    "transport": "relay",
+    "binary_sha256": "a6edc9fd99cd382ca4ed70968fd6ac08fe4477f33db702d8d83a514a1f5fc394",
+    "approval_button_automated": true,
+    "human_click_claim": false,
+    "evidence_dir": "/tmp/agent-tunnel-inspector-proof-hupkyp2i",
+    "status": "passed",
+    "protocol": "2026-07-28",
+    "full_command_displayed": true,
+    "no_effect_before_approval": true,
+    "approval_runs_once": true,
+    "decline_no_effect": true
+  },
+  "local-relay-300s": {
+    "test": "local_relay_cross_process_simulated_sdk_confirmation",
+    "real_agent_acceptance": false,
+    "evidence_dir": "/tmp/agent-tunnel-local-7bt064hy",
+    "binary_sha256": "1e06a92ca26b66bc77e729658a667c701c50e8478f7b11be1c860e60a7bb9a1e",
+    "status": "passed",
+    "elapsed_seconds": 300.01,
+    "client_exit": 0
+  },
+  "inspector-quick-not-ready": {
+    "test": "official_Inspector_2_8_0_real_web_UI",
+    "transport": "quick",
+    "status": "unverified_access_not_ready",
+    "reason": "api.trycloudflare.com/tunnel headers timeout/EOF; no protocol incompatibility conclusion",
+    "binary_sha256": "a6edc9fd99cd382ca4ed70968fd6ac08fe4477f33db702d8d83a514a1f5fc394",
+    "evidence_dir": "/tmp/agent-tunnel-inspector-proof-uw60ctex"
+  }
+}
