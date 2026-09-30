@@ -88,8 +88,11 @@ func (n *Node) checkLocked() executor.Result {
 	if n.Expired() {
 		return executor.Failure("TOKEN_EXPIRED", "token expired")
 	}
-	if n.unhealthy || n.History.Err() != nil {
+	if n.History.Err() != nil {
 		return executor.Failure("HISTORY_UNAVAILABLE", "execution disabled: history or process cleanup is unhealthy; restart after repair")
+	}
+	if n.unhealthy {
+		return executor.Failure("TARGET_UNHEALTHY", "process cleanup could not be confirmed; restart after inspection")
 	}
 	if n.state != "ready" {
 		return executor.Failure("TARGET_OFFLINE", "target is not connected")
@@ -251,14 +254,18 @@ func (n *Node) Info() map[string]any {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	health := "ok"
-	if n.unhealthy || n.History.Err() != nil {
+	if n.History.Err() != nil {
 		health = "failed"
+	}
+	executionHealth := "ok"
+	if n.unhealthy {
+		executionHealth = "disabled"
 	}
 	state := n.state
 	if n.Expired() {
 		state = "expired"
 	}
-	return map[string]any{"name": n.Config.Name, "instance_id": n.InstanceID, "mode": n.Config.Mode, "expires_at": n.Expires.UTC(), "transport": n.Config.Transport, "connection_state": state, "mcp_url_available": n.url != "", "default_cwd": n.Cwd, "shell": n.Config.Shell, "uid": os.Geteuid(), "gid": os.Getegid(), "command_timeout_seconds": n.Config.Timeout.Seconds(), "concurrency": n.Config.Concurrency, "active_commands": len(n.active), "active_http_requests": n.httpActive, "pending_confirmations": len(n.pending), "capture_bytes_per_stream": config.CaptureLimit, "default_output_bytes": config.DefaultOutput, "max_output_bytes": config.MaxOutput, "history_path": n.History.Path(), "history_status": health}
+	return map[string]any{"name": n.Config.Name, "instance_id": n.InstanceID, "mode": n.Config.Mode, "expires_at": n.Expires.UTC(), "transport": n.Config.Transport, "connection_state": state, "mcp_url_available": n.url != "", "default_cwd": n.Cwd, "shell": n.Config.Shell, "uid": os.Geteuid(), "gid": os.Getegid(), "command_timeout_seconds": n.Config.Timeout.Seconds(), "concurrency": n.Config.Concurrency, "active_commands": len(n.active), "active_http_requests": n.httpActive, "pending_confirmations": len(n.pending), "capture_bytes_per_stream": config.CaptureLimit, "default_output_bytes": config.DefaultOutput, "max_output_bytes": config.MaxOutput, "history_path": n.History.Path(), "history_status": health, "execution_status": executionHealth}
 }
 func (n *Node) sweep() {
 	ticker := time.NewTicker(time.Second)

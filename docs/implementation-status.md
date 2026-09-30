@@ -10,6 +10,8 @@
 
 - MCP/目标核心：锁定官方 Go SDK v1.8.0。`go test -race ./internal/target ./internal/mcpserver` 通过，包括 JSON-only MRTR 审核同意/拒绝、全部放行/严格、确认不可用、命令绑定、防重、取消/繁忙、连接变代及日志前后故障。确认回复由测试程序生成，不是实际 Agent UI 或真人确认，不计作 G0。
 
+- 多目标中转：`go test -race ./internal/relay ./internal/relayproto` 通过；覆盖两目标/同名隔离、审核同意/拒绝、错误注册密钥、离线不排队、断线后继续一次执行、同实例原地址重连、中转重启新地址/原到期时间。转发丢失的已知未知结果转换为 MCP 工具错误（started=null），避免 SDK 丢弃 HTTP 502 body 后只显示 Bad Gateway；目标仍唯一授权/执行。
+
 ## 尚未验收
 
 真实 Agent 用户确认（G0）、两种公网入口长命令（G1）、发布物及完整故障矩阵仍未通过，不宣称首版已经完成。

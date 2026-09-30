@@ -28,6 +28,8 @@ type Input struct {
 	MaxOutputBytes int      `json:"max_output_bytes,omitempty"`
 }
 type Spec struct {
+	UID int `json:"uid"`
+	GID int `json:"gid"`
 	Input
 	Shell   string        `json:"shell"`
 	Timeout time.Duration `json:"timeout_ns"`
@@ -84,7 +86,7 @@ func Normalize(in Input, cwd, shell string, timeout time.Duration) (Spec, error)
 		v := *in.ShellCommand
 		in.ShellCommand = &v
 	}
-	return Spec{Input: in, Shell: shell, Timeout: timeout}, nil
+	return Spec{Input: in, Shell: shell, Timeout: timeout, UID: os.Geteuid(), GID: os.Getegid()}, nil
 }
 
 type Result struct {
@@ -212,6 +214,15 @@ func (runner Runner) Run(owner context.Context, s Spec) Result {
 	defer errR.Close()
 	cmd.Stdout = outW
 	cmd.Stderr = errW
+	if owner.Err() != nil {
+		outW.Close()
+		errW.Close()
+		r.Status = "rejected"
+		r.Code = "TARGET_STOPPED"
+		r.Message = "target stopped before process launch"
+		r.EndTime = time.Now().UTC()
+		return r
+	}
 	if err = cmd.Start(); err != nil {
 		outW.Close()
 		errW.Close()
